@@ -8,7 +8,8 @@ import json
 import math
 from pathlib import Path
 
-from paper import best_no_trade, position_deteriorated, simulate_buy_fill
+from filters import Policy
+from paper import best_no_trade, paper_config, position_deteriorated, simulate_buy_fill
 
 
 def complete_events(rows: list[dict]) -> tuple[dict[str, list[dict]], Counter]:
@@ -59,14 +60,12 @@ def fit_shrinkage(events: list[list[dict]]) -> float:
 def quote_payoffs(
     rows: list[dict],
     event_ids: set[str],
-    max_trades_per_city_day: int = 3,
-    deterioration_probability_drop: float = 0.15,
-    deterioration_net_edge: float = 0.0,
-    notional_usd: float = 10.0,
-    max_slippage_per_share: float = 0.03,
-    weather_fee_rate: float = 0.05,
+    cfg: dict | None = None,
 ) -> dict:
-    """Replay live-like NO selection and reuse live fill simulation when L2 is available."""
+    """Replay live NO selection, city/day gating, latency snapshots, and fills."""
+    cfg = cfg or {}
+    pcfg = paper_config(cfg)
+    policy = Policy.from_config(cfg)
     snapshots: dict[tuple[str, str, str, str], list[dict]] = defaultdict(list)
     for row in rows:
         if row.get("event_id") not in event_ids:
@@ -81,28 +80,28 @@ def quote_payoffs(
         )
         snapshots[key].append(row)
 
-    entries_by_city_day: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    selected: list[dict] = []
+    fills_by_city_day: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    selected_signals: list[dict] = []
+    simulated_fills: list[dict] = []
 
     for snapshot_key in sorted(snapshots):
         _, city, target_date, _ = snapshot_key
         decisions = snapshots[snapshot_key]
         city_day = (city, target_date)
-        prior = entries_by_city_day[city_day]
+        prior_fills = fills_by_city_day[city_day]
 
-        if not prior:
+        if not prior_fills:
             allowed = True
-        elif len(prior) >= max_trades_per_city_day:
+        elif len(prior_fills) >= pcfg["max_trades_per_city_day"]:
             allowed = False
         else:
-            deteriorated = position_deteriorated(
-                prior[-1],
-                decisions,
-                deterioration_probability_drop,
-                deterioration_net_edge,
+            allowed = bool(
+                position_deteriorated(
+                    prior_fills[-1],
+                    decisions,
+                    pcfg["deterioration_probability_drop"],
+                )
             )
-            allowed = bool(deteriorated)
-
         if not allowed:
             continue
 
@@ -117,51 +116,52 @@ def quote_payoffs(
         best = best_no_trade(executable)
         if best is None:
             continue
-        prior.append(best)
-        selected.append(best)
+        selected_signals.append(best)
 
-    quote_payoffs_per_share = [
-        int(row["won"]) - float(row["entry_cost"])
-        for row in selected
-    ]
-    simulated_fills = []
-    for row in selected:
-        raw_levels = row.get("ask_levels_json")
-        if not raw_levels or row.get("best_ask") in (None, ""):
+        raw_levels = best.get("execution_ask_levels_json")
+        if not raw_levels or best.get("best_ask") in (None, ""):
             continue
         try:
             ask_levels = json.loads(raw_levels)
-            ask = float(row["best_ask"])
-            desired_shares = notional_usd / ask
+            signal_ask = float(best["best_ask"])
+            desired_shares = pcfg["notional_usd"] / signal_ask
             fill = simulate_buy_fill(
                 ask_levels,
                 desired_shares,
-                min(0.999, ask + max_slippage_per_share),
-                weather_fee_rate,
+                min(0.999, signal_ask + pcfg["max_slippage_per_share"]),
+                policy.weather_fee_rate,
             )
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
         if fill["filled_shares"] <= 0:
             continue
-        payout = fill["filled_shares"] if int(row["won"]) else 0.0
+
+        prior_fills.append(best)
+        payout = fill["filled_shares"] if int(best["won"]) else 0.0
         simulated_fills.append({
-            "event_id": row["event_id"],
-            "market_id": row["market_id"],
+            "event_id": best["event_id"],
+            "market_id": best["market_id"],
             "filled_shares": fill["filled_shares"],
             "total_cost": fill["total_cost"],
             "payout": payout,
             "pnl": payout - fill["total_cost"],
         })
 
+    quote_payoffs_per_share = [
+        int(row["won"]) - float(row["entry_cost"])
+        for row in selected_signals
+    ]
     return {
-        "events_with_quoted_entry": len({row["event_id"] for row in selected}),
+        "events_with_quoted_entry": len({row["event_id"] for row in selected_signals}),
         "city_days_with_quoted_entry": len({
             (row.get("city") or row["event_id"], row.get("target_date") or "")
-            for row in selected
+            for row in selected_signals
         }),
-        "quoted_entries": len(selected),
-        "target_day_entries": sum(str(row.get("pre_target_day")) == "False" for row in selected),
-        "wins": sum(int(row["won"]) for row in selected),
+        "quoted_entries": len(selected_signals),
+        "target_day_entries": sum(
+            str(row.get("pre_target_day")) == "False" for row in selected_signals
+        ),
+        "wins": sum(int(row["won"]) for row in selected_signals),
         "quoted_payoff_per_share_sum": round(sum(quote_payoffs_per_share), 6),
         "quoted_payoff_per_share_mean": (
             round(sum(quote_payoffs_per_share) / len(quote_payoffs_per_share), 6)
@@ -171,8 +171,8 @@ def quote_payoffs(
         "simulated_fill_pnl_sum": round(sum(fill["pnl"] for fill in simulated_fills), 6),
         "simulated_fill_cost_sum": round(sum(fill["total_cost"] for fill in simulated_fills), 6),
         "fill_assumption": (
-            "live simulate_buy_fill used when full L2 ask levels are present; "
-            "quote-only entries remain execution-unverified"
+            "live simulate_buy_fill using the recorded execution-time L2 snapshot; "
+            "signals without an execution-time book remain unfilled and do not lock city/day"
         ),
     }
 
@@ -191,7 +191,8 @@ def reliability(events: list[list[dict]], alpha: float) -> list[dict]:
 
 def analyze(rows: list[dict], test_fraction: float = .3,
             min_train_events: int = 20, min_test_events: int = 10,
-            min_train_dates: int = 5, min_test_dates: int = 2) -> dict:
+            min_train_dates: int = 5, min_test_dates: int = 2,
+            cfg: dict | None = None) -> dict:
     events, excluded = complete_events(rows)
     days = sorted({e[0]["target_date"] for e in events.values()})
     report = {"status": "INSUFFICIENT_VERIFIED_HISTORY", "dataset_rows": len(rows),
@@ -214,7 +215,7 @@ def analyze(rows: list[dict], test_fraction: float = .3,
             "calibrated_brier_per_event": round(sum(event_brier(e, alpha) for e in group) / len(group), 6),
             "raw_log_loss": round(sum(event_log_loss(e) for e in group) / len(group), 6),
             "calibrated_log_loss": round(sum(event_log_loss(e, alpha) for e in group) / len(group), 6),
-            "reliability": reliability(group, alpha), "quoted_entries": quote_payoffs(rows, ids),
+            "reliability": reliability(group, alpha), "quoted_entries": quote_payoffs(rows, ids, cfg),
         }
     report["train_fitted_uniform_shrinkage"] = alpha
     if (len(train_ids) >= min_train_events and len(test_ids) >= min_test_events
@@ -240,6 +241,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dataset", default="data/step4_dataset.csv")
     ap.add_argument("--out", default="data/step4_report.json")
+    ap.add_argument("--config", default="config.json")
     ap.add_argument("--test-fraction", type=float, default=.3)
     args = ap.parse_args()
     if not 0 < args.test_fraction < 1:
@@ -252,7 +254,9 @@ def main() -> None:
                     "entry_cost", "net_edge", "depth_verified"}
         if rows and not required.issubset(rows[0]):
             raise ValueError("Dataset is missing required Step 4 fields")
-        result = analyze(rows, args.test_fraction)
+        config_path = Path(args.config)
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+        result = analyze(rows, args.test_fraction, cfg=cfg)
     except (ValueError, OSError) as exc:
         ap.error(str(exc))
     out = Path(args.out)
