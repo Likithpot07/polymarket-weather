@@ -11,6 +11,7 @@ import time
 
 from decide import event_decisions
 from filters import Policy
+from paper import PAPER_DDL, process_pending_orders, schedule_order, settle_positions, stats as paper_stats
 
 LIVE_DDL = """
 CREATE TABLE IF NOT EXISTS live_decision_runs (
@@ -251,17 +252,22 @@ def run_cycle(
     db: sqlite3.Connection,
     policy: Policy,
     event_ids: list[str] | None,
-    as_of: datetime,
+    as_of: datetime | None,
+    cfg: dict,
 ) -> dict:
-    ids = event_ids or active_event_ids(db, as_of)
+    discovery_time = as_of or datetime.now(timezone.utc)
+    ids = event_ids or active_event_ids(db, discovery_time)
     summary = {"events": 0, "trade": 0, "watch": 0, "skip": 0, "errors": 0, "new_trades": []}
 
     for event_id in ids:
+        evaluation_time = as_of or datetime.now(timezone.utc)
         try:
-            state, decisions = event_decisions(db, event_id, as_of, policy)
+            state, decisions = event_decisions(db, event_id, evaluation_time, policy)
             counts = Counter(d["action"] for d in decisions)
             with db:
-                new_trades = persist_snapshot(db, state, decisions, as_of)
+                new_trades = persist_snapshot(db, state, decisions, evaluation_time)
+                for decision in new_trades:
+                    schedule_order(db, state, decision, datetime.now(timezone.utc), cfg)
             summary["events"] += 1
             summary["trade"] += counts.get("TRADE", 0)
             summary["watch"] += counts.get("WATCH", 0)
@@ -270,7 +276,7 @@ def run_cycle(
                 [{"event_id": event_id, **decision} for decision in new_trades]
             )
             print(
-                f"{as_of.isoformat()} | {event_id} | {state['city']} | "
+                f"{evaluation_time.isoformat()} | {event_id} | {state['city']} | "
                 f"{state['target_date']} | TRADE={counts.get('TRADE', 0)} "
                 f"WATCH={counts.get('WATCH', 0)} SKIP={counts.get('SKIP', 0)}",
                 flush=True,
@@ -281,8 +287,25 @@ def run_cycle(
                 print(f"{prefix} | {format_trade(decision)}", flush=True)
         except (ValueError, sqlite3.Error) as exc:
             summary["errors"] += 1
-            print(f"{as_of.isoformat()} | {event_id} | ERROR | {exc}", flush=True)
+            print(f"{evaluation_time.isoformat()} | {event_id} | ERROR | {exc}", flush=True)
 
+    paper_now = datetime.now(timezone.utc)
+    fills = process_pending_orders(db, paper_now, cfg, policy.weather_fee_rate)
+    settled = settle_positions(db, paper_now, cfg)
+    for fill in fills:
+        print(
+            f"PAPER FILL | {fill['side']} | shares={fill['filled_shares']:.4f} | "
+            f"vwap={fill['vwap']:.4f} | cost={fill['total_cost']:.2f} | "
+            f"{fill.get('bracket')}",
+            flush=True,
+        )
+    for item in settled:
+        print(
+            f"PAPER SETTLED | {item['side']} | {item['status']} | "
+            f"pnl={item['pnl']:+.2f}",
+            flush=True,
+        )
+    summary["paper"] = paper_stats(db)
     return summary
 
 
@@ -313,6 +336,7 @@ def main() -> None:
     db.execute("PRAGMA foreign_keys=ON")
     db.execute("PRAGMA busy_timeout=5000")
     db.executescript(LIVE_DDL)
+    db.executescript(PAPER_DDL)
 
     print(
         "LIVE PAPER SIGNALS | no orders are placed | "
@@ -323,12 +347,15 @@ def main() -> None:
     try:
         while True:
             cycle_started = time.monotonic()
-            now = datetime.now(timezone.utc)
-            summary = run_cycle(db, policy, requested_events, now)
+            summary = run_cycle(db, policy, requested_events, None, cfg)
             print(
                 f"CYCLE | events={summary['events']} TRADE={summary['trade']} "
                 f"WATCH={summary['watch']} SKIP={summary['skip']} "
-                f"errors={summary['errors']} new={len(summary['new_trades'])}",
+                f"errors={summary['errors']} new={len(summary['new_trades'])} | "
+                f"PAPER pending={summary['paper']['pending']} "
+                f"open={summary['paper']['filled_open']} "
+                f"settled={summary['paper']['settled']} "
+                f"realized_pnl={summary['paper']['realized_pnl']:+.2f}",
                 flush=True,
             )
             if args.once:
