@@ -27,11 +27,16 @@ class BacktestTest(unittest.TestCase):
         base = {"event_id": "x", "city": "NYC", "target_date": "2026-09-25",
                 "market_id": "m1", "side": "NO", "model_probability": "0.8",
                 "as_of": "2026-09-24T12:00:00Z", "action": "WATCH", "won": "1",
-                "entry_cost": "0.4", "net_edge": "0.5", "depth_verified": "False",
+                "entry_cost": "0.4", "best_ask": "0.4",
+                "ask_levels_json": '[{"price":0.4,"size":30}]',
+                "net_edge": "0.5", "depth_verified": "False",
                 "rules_verified": "True", "pre_target_day": "True"}
         self.assertEqual(quote_payoffs([base], {"x"})["events_with_quoted_entry"], 0)
         trade = {**base, "action": "TRADE", "depth_verified": "True"}
         self.assertAlmostEqual(quote_payoffs([base, trade], {"x"})["quoted_payoff_per_share_sum"], .6)
+        replay = quote_payoffs([base, trade], {"x"})
+        self.assertEqual(replay["simulated_fills"], 1)
+        self.assertAlmostEqual(replay["simulated_fill_pnl_sum"], 14.7)
 
     def test_quote_payoff_replays_live_deterioration_gate(self):
         rows = [
