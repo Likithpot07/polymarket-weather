@@ -66,6 +66,9 @@ def paper_config(cfg: dict) -> dict:
         "max_slippage_per_share": float(raw.get("max_slippage_per_share", 0.03)),
         "max_book_age_seconds": float(raw.get("max_book_age_seconds", 10.0)),
         "settlement_check_seconds": float(raw.get("settlement_check_seconds", 300.0)),
+        "max_trades_per_city_day": int(raw.get("max_trades_per_city_day", 3)),
+        "deterioration_probability_drop": float(raw.get("deterioration_probability_drop", 0.15)),
+        "deterioration_net_edge": float(raw.get("deterioration_net_edge", 0.0)),
     }
     if result["notional_usd"] <= 0:
         raise ValueError("paper.notional_usd must be positive")
@@ -75,7 +78,85 @@ def paper_config(cfg: dict) -> dict:
         raise ValueError("paper.max_slippage_per_share must be between 0 and 1")
     if result["max_book_age_seconds"] <= 0 or result["settlement_check_seconds"] <= 0:
         raise ValueError("paper book/settlement intervals must be positive")
+    if result["max_trades_per_city_day"] < 1:
+        raise ValueError("paper.max_trades_per_city_day must be >= 1")
+    if not 0 <= result["deterioration_probability_drop"] <= 1:
+        raise ValueError("paper.deterioration_probability_drop must be between 0 and 1")
+    if not math.isfinite(result["deterioration_net_edge"]):
+        raise ValueError("paper.deterioration_net_edge must be finite")
     return result
+
+
+def city_day_gate(
+    db: sqlite3.Connection,
+    city: str,
+    target_date: str,
+    decisions: list[dict],
+    cfg: dict,
+) -> tuple[bool, str]:
+    """Allow one fill per city/day; reopen only when the latest fill deteriorates."""
+    pcfg = paper_config(cfg)
+    pending = db.execute(
+        """SELECT count(*)
+           FROM paper_orders p
+           JOIN markets m ON m.id=p.market_id
+           WHERE m.city=? AND m.target_date=? AND p.status='PENDING'""",
+        (city, target_date),
+    ).fetchone()[0]
+    if pending:
+        return False, "CITY_DAY_PENDING_ORDER"
+
+    filled = db.execute(
+        """SELECT count(*)
+           FROM paper_orders p
+           JOIN markets m ON m.id=p.market_id
+           WHERE m.city=? AND m.target_date=?
+             AND p.filled_shares>0""",
+        (city, target_date),
+    ).fetchone()[0]
+    if filled == 0:
+        return True, "FIRST_CITY_DAY_TRADE"
+    if filled >= pcfg["max_trades_per_city_day"]:
+        return False, "CITY_DAY_MAX_TRADES"
+
+    latest = db.execute(
+        """SELECT p.market_id,p.side,p.model_probability
+           FROM paper_orders p
+           JOIN markets m ON m.id=p.market_id
+           WHERE m.city=? AND m.target_date=? AND p.filled_shares>0
+           ORDER BY p.fill_at DESC,p.id DESC
+           LIMIT 1""",
+        (city, target_date),
+    ).fetchone()
+    if not latest:
+        return False, "CITY_DAY_LOCKED"
+
+    market_id, side, entry_probability = latest
+    current = next(
+        (
+            d for d in decisions
+            if str(d.get("market_id")) == str(market_id)
+            and str(d.get("side")).upper() == str(side).upper()
+        ),
+        None,
+    )
+    if not current:
+        return False, "LATEST_POSITION_NOT_EVALUATED"
+
+    current_probability = current.get("model_probability")
+    current_edge = current.get("net_edge")
+    probability_bad = (
+        current_probability is not None
+        and float(current_probability)
+        <= float(entry_probability) - pcfg["deterioration_probability_drop"]
+    )
+    edge_bad = (
+        current_edge is not None
+        and float(current_edge) <= pcfg["deterioration_net_edge"]
+    )
+    if probability_bad or edge_bad:
+        return True, "LATEST_POSITION_DETERIORATED"
+    return False, "CITY_DAY_HEALTHY_POSITION"
 
 
 def schedule_order(
@@ -86,7 +167,11 @@ def schedule_order(
     cfg: dict,
 ) -> int | None:
     pcfg = paper_config(cfg)
-    if not pcfg["enabled"] or decision.get("action") != "TRADE":
+    if (
+        not pcfg["enabled"]
+        or decision.get("action") != "TRADE"
+        or str(decision.get("side")).upper() != "NO"
+    ):
         return None
     token = decision.get("token_id")
     ask = decision.get("best_ask")
