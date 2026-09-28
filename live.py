@@ -11,7 +11,7 @@ import time
 
 from decide import event_decisions
 from filters import Policy
-from paper import PAPER_DDL, city_day_gate, process_pending_orders, schedule_order, settle_positions, stats as paper_stats
+from paper import PAPER_DDL, best_no_trade, city_day_gate, process_pending_orders, schedule_order, settle_positions, stats as paper_stats
 
 LIVE_DDL = """
 CREATE TABLE IF NOT EXISTS live_decision_runs (
@@ -268,11 +268,7 @@ def run_cycle(
             gate_reason = None
             with db:
                 new_trades = persist_snapshot(db, state, decisions, evaluation_time)
-                no_trades = [
-                    d for d in decisions
-                    if d["action"] == "TRADE" and str(d["side"]).upper() == "NO"
-                ]
-                no_trades.sort(key=lambda d: -(d.get("net_edge") or -999))
+                best = best_no_trade(decisions)
                 allowed, gate_reason = city_day_gate(
                     db,
                     state["city"],
@@ -280,8 +276,7 @@ def run_cycle(
                     decisions,
                     cfg,
                 )
-                if allowed and no_trades:
-                    best = no_trades[0]
+                if allowed and best:
                     order_id = schedule_order(
                         db,
                         state,
