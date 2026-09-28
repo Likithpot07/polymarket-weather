@@ -110,7 +110,7 @@ def assess(state: dict, outcome: dict, side: str, quote: dict | None,
     target = date.fromisoformat(state["target_date"])
     if local_day > target:
         hard.append("EVENT_DAY_OVER")
-    elif policy.watch_on_target_day and local_day == target:
+    elif policy.watch_on_target_day and local_day == target and not state.get("in_day_observations_modeled"):
         soft.append("IN_DAY_OBSERVATIONS_NOT_MODELED")
     result["reasons"] = hard + soft
     result["action"] = "SKIP" if hard else "WATCH" if soft else "TRADE"
