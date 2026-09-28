@@ -255,13 +255,13 @@ def build(db: sqlite3.Connection, events: list[str], cfg: dict, policy: Policy,
             (eid,),
         ).fetchall()
 
-        pre_target_times = [as_of for as_of in times if as_of < start_day]
-        in_day_count = len(times) - len(pre_target_times)
-        if in_day_count:
-            skips["IN_DAY_CYCLE"] += in_day_count
-            print(f"  in-day cycles skipped: {in_day_count}", flush=True)
-
-        if not pre_target_times:
+        end_day = datetime.combine(
+            date.fromisoformat(target) + timedelta(days=1),
+            time.min,
+            ZoneInfo(location[0]),
+        ).astimezone(timezone.utc)
+        decision_times = [as_of for as_of in times if as_of < end_day]
+        if not decision_times:
             print(
                 f"  snapshots: 0 | rows: 0 | elapsed: "
                 f"{perf_counter() - event_started:.2f}s",
@@ -269,12 +269,15 @@ def build(db: sqlite3.Connection, events: list[str], cfg: dict, policy: Policy,
             )
             continue
 
+        pre_target_count = sum(as_of < start_day for as_of in decision_times)
+        in_day_count = len(decision_times) - pre_target_count
         print(
-            f"  processing {len(pre_target_times)} pre-target cycle(s)...",
+            f"  processing {len(decision_times)} cycle(s) "
+            f"({pre_target_count} pre-target, {in_day_count} target-day)...",
             flush=True,
         )
 
-        for cycle_no, as_of in enumerate(pre_target_times, 1):
+        for cycle_no, as_of in enumerate(decision_times, 1):
             cycle_work_started = perf_counter()
             before = len(rows)
 
@@ -283,7 +286,7 @@ def build(db: sqlite3.Connection, events: list[str], cfg: dict, policy: Policy,
             except ValueError:
                 skips["INCOMPLETE_PROBABILITY"] += 1
                 print(
-                    f"    [{cycle_no}/{len(pre_target_times)}] "
+                    f"    [{cycle_no}/{len(decision_times)}] "
                     f"{as_of.isoformat()} -> INCOMPLETE_PROBABILITY "
                     f"({perf_counter() - cycle_work_started:.2f}s)",
                     flush=True,
@@ -306,7 +309,7 @@ def build(db: sqlite3.Connection, events: list[str], cfg: dict, policy: Policy,
                 rows.append({
                     "event_id": eid, "city": city, "target_date": target,
                     "market_id": d["market_id"], "side": d["side"],
-                    "as_of": as_of.isoformat(), "pre_target_day": True,
+                    "as_of": as_of.isoformat(), "pre_target_day": as_of < start_day,
                     "model_version": VERSION,
                     "model_probability": d["model_probability"],
                     "model_spread_c": d.get("model_spread_c"),
