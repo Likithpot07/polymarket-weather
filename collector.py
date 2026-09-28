@@ -307,8 +307,6 @@ async def scan(db: sqlite3.Connection, cfg: dict) -> dict[str, str]:
                 JOIN markets m ON t.market_id=m.id WHERE m.event_id=? AND m.active=1""", (eid,)):
             token_map.setdefault(token, mid)
     pinned_count = len(token_map)
-    if pinned_count > cfg["max_tokens"]:
-        raise ValueError(f"Pinned events require {pinned_count} tokens, exceeding max_tokens={cfg['max_tokens']}")
     for term in cfg["search_terms"]:
         try:
             result = await fetch(f"{GAMMA}/public-search?{urlencode({'q': term, 'limit_per_type': cfg['max_events_per_search']})}")
@@ -339,9 +337,8 @@ async def scan(db: sqlite3.Connection, cfg: dict) -> dict[str, str]:
     # Keep subscriptions to markets already stored when a search page misses them.
     for token, mid in db.execute("SELECT t.token_id,t.market_id FROM tokens t JOIN markets m ON t.market_id=m.id WHERE m.active=1"):
         token_map.setdefault(token, mid)
-    selected = dict(list(token_map.items())[:cfg["max_tokens"]])
-    LOG.info("CLOB tokens selected: %d/%d (pinned: %d)", len(selected), len(token_map), pinned_count)
-    return selected
+    LOG.info("CLOB tokens discovered: %d (pinned: %d)", len(token_map), pinned_count)
+    return token_map
 async def location_for(db: sqlite3.Connection, cfg: dict, city: str) -> dict | None:
     configured = cfg.get("city_locations", {}).get(city)
     if configured:
@@ -574,14 +571,21 @@ def record_frame(db: sqlite3.Connection, frame: dict, tokens: set[str]) -> int:
     if count:
         db.commit()
     return count
-async def stream_books(db: sqlite3.Connection, tokens: set[str]) -> None:
+def chunk_tokens(tokens: set[str], size: int) -> list[set[str]]:
+    """Split tokens across websocket subscriptions without dropping any token."""
+    if size < 1:
+        raise ValueError("max_tokens_per_socket must be positive")
+    ordered = sorted(tokens)
+    return [set(ordered[i:i + size]) for i in range(0, len(ordered), size)]
+
+async def stream_books(db: sqlite3.Connection, tokens: set[str], socket_id: int = 1) -> None:
     import websockets
     delay = 1
     while tokens:
         try:
             async with websockets.connect(WS, ping_interval=None, max_size=8_000_000) as ws:
                 await ws.send(json.dumps({"assets_ids": sorted(tokens), "type": "market", "custom_feature_enabled": True}))
-                LOG.info("CLOB connected | %d tokens", len(tokens))
+                LOG.info("CLOB socket %d connected | %d tokens", socket_id, len(tokens))
                 delay = 1
                 async def heartbeat():
                     while True:
@@ -605,7 +609,7 @@ async def stream_books(db: sqlite3.Connection, tokens: set[str]) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            LOG.warning("CLOB disconnected (%s); retrying in %ss", exc, delay)
+            LOG.warning("CLOB socket %d disconnected (%s); retrying in %ss", socket_id, exc, delay)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
 
@@ -639,7 +643,7 @@ async def collect(
     seconds: float | None,
     once: bool,
 ) -> None:
-    ws_task = None
+    ws_tasks: list[asyncio.Task] = []
     prep_task = None
     current: set[str] = set()
     last_forecast = 0.0
@@ -659,19 +663,28 @@ async def collect(
                 await collect_observations(db, cfg)
                 await collect_forecasts(db, cfg)
                 return
-            # 2. Start/refresh CLOB websocket immediately.
-            if tokens != current or ws_task is None or ws_task.done():
-                if ws_task:
-                    ws_task.cancel()
-                    await asyncio.gather(
-                        ws_task,
-                        return_exceptions=True,
-                    )
+            # 2. Start/refresh CLOB websockets immediately.
+            socket_size = int(cfg.get("max_tokens_per_socket", cfg.get("max_tokens", 200)))
+            sockets_healthy = bool(ws_tasks) and all(not task.done() for task in ws_tasks)
+            if tokens != current or not sockets_healthy:
+                for task in ws_tasks:
+                    task.cancel()
+                if ws_tasks:
+                    await asyncio.gather(*ws_tasks, return_exceptions=True)
+                ws_tasks = []
                 current = tokens
                 if current:
-                    ws_task = asyncio.create_task(
-                        stream_books(db, current)
+                    chunks = chunk_tokens(current, socket_size)
+                    LOG.info(
+                        "CLOB subscribing to all %d tokens across %d socket(s), max %d/socket",
+                        len(current),
+                        len(chunks),
+                        socket_size,
                     )
+                    ws_tasks = [
+                        asyncio.create_task(stream_books(db, chunk, index))
+                        for index, chunk in enumerate(chunks, 1)
+                    ]
             # Let the websocket task start before slower REST collection.
             await asyncio.sleep(0)
             now = time.monotonic()
@@ -721,12 +734,10 @@ async def collect(
         if prep_task:
             prep_task.cancel()
             await asyncio.gather(prep_task, return_exceptions=True)
-        if ws_task:
-            ws_task.cancel()
-            await asyncio.gather(
-                ws_task,
-                return_exceptions=True,
-            )
+        for task in ws_tasks:
+            task.cancel()
+        if ws_tasks:
+            await asyncio.gather(*ws_tasks, return_exceptions=True)
 def import_observations(db: sqlite3.Connection, path: str) -> None:
     with open(path, newline="", encoding="utf-8-sig") as file:
         rows = list(csv.DictReader(file))
