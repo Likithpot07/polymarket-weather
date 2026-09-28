@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from collector import DDL, extract_date, record_frame, save_event
+from collector import DDL, chunk_tokens, extract_date, record_frame, save_event
 
 
 class CollectorTest(unittest.TestCase):
@@ -24,6 +24,13 @@ class CollectorTest(unittest.TestCase):
 
     def test_unverified_year_stays_unknown(self):
         self.assertIsNone(extract_date("Highest temperature in London on September 25?", "some-slug"))
+
+    def test_chunk_tokens_keeps_every_token(self):
+        tokens = {str(i) for i in range(1556)}
+        chunks = chunk_tokens(tokens, 200)
+        self.assertEqual(len(chunks), 8)
+        self.assertTrue(all(len(chunk) <= 200 for chunk in chunks))
+        self.assertEqual(set().union(*chunks), tokens)
 
     def test_full_book_uses_price_extrema_and_keeps_depth(self):
         frame = {"event_type": "book", "asset_id": "101", "timestamp": "1234",
