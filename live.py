@@ -275,8 +275,10 @@ def run_cycle(
                 f"WATCH={counts.get('WATCH', 0)} SKIP={counts.get('SKIP', 0)}",
                 flush=True,
             )
-            for decision in new_trades:
-                print(f"NEW TRADE SIGNAL | {format_trade(decision)}", flush=True)
+            current_trades = [d for d in decisions if d["action"] == "TRADE"]
+            for decision in current_trades:
+                prefix = "NEW TRADE SIGNAL" if decision in new_trades else "TRADE NOW"
+                print(f"{prefix} | {format_trade(decision)}", flush=True)
         except (ValueError, sqlite3.Error) as exc:
             summary["errors"] += 1
             print(f"{as_of.isoformat()} | {event_id} | ERROR | {exc}", flush=True)
