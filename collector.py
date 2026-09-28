@@ -549,10 +549,14 @@ def record_frame(db: sqlite3.Connection, frame: dict, tokens: set[str]) -> int:
             bids, asks = frame.get("bids") or [], frame.get("asks") or []
             bid = max((float(level["price"]) for level in bids), default=None)
             ask = min((float(level["price"]) for level in asks), default=None)
+        stored = frame
+        if event_type == "price_change":
+            stored = dict(frame)
+            stored["price_changes"] = [entry]
         db.execute("INSERT INTO book_events(token_id,event_type,source_timestamp,received_at,best_bid,best_ask,raw_json) VALUES (?,?,?,?,?,?,?)",
                    (token, event_type, str(frame.get("timestamp") or ""), received,
                     str(bid) if bid is not None else None, str(ask) if ask is not None else None,
-                    json.dumps(frame)))
+                    json.dumps(stored)))
         count += 1
     if count:
         db.commit()
