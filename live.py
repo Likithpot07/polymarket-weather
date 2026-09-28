@@ -322,13 +322,26 @@ def run_cycle(
             print(f"{evaluation_time.isoformat()} | {event_id} | ERROR | {exc}", flush=True)
 
     paper_now = datetime.now(timezone.utc)
-    fills = process_pending_orders(db, paper_now, cfg, policy.weather_fee_rate)
+    executions = process_pending_orders(db, paper_now, cfg, policy.weather_fee_rate)
     settled = settle_positions(db, paper_now, cfg)
-    for fill in fills:
+    for item in executions:
+        if item["status"] == "NO_FILL":
+            details = []
+            if item.get("book_age_seconds") is not None:
+                details.append(f"book_age={item['book_age_seconds']:.2f}s")
+            if item.get("available_depth") is not None:
+                details.append(f"depth={item['available_depth']:.2f}")
+            extra = f" | {' | '.join(details)}" if details else ""
+            print(
+                f"PAPER NO FILL | {item['side']} | reason={item['reason']} | "
+                f"signal_ask={item['signal_ask']:.3f} | {item.get('bracket')}{extra}",
+                flush=True,
+            )
+            continue
         print(
-            f"PAPER FILL | {fill['side']} | shares={fill['filled_shares']:.4f} | "
-            f"vwap={fill['vwap']:.4f} | cost={fill['total_cost']:.2f} | "
-            f"{fill.get('bracket')}",
+            f"PAPER FILL | {item['side']} | shares={item['filled_shares']:.4f} | "
+            f"vwap={item['vwap']:.4f} | cost={item['total_cost']:.2f} | "
+            f"{item.get('bracket')}",
             flush=True,
         )
     for item in settled:
