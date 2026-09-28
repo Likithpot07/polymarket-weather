@@ -2,6 +2,7 @@ name: audit-fixes-tests
 on:
   push:
     branches:
+      - main
       - audit-fixes-1-4
   pull_request:
     branches:
