@@ -221,9 +221,19 @@ def analyze(rows: list[dict], test_fraction: float = .3,
     if (len(train_ids) >= min_train_events and len(test_ids) >= min_test_events
             and len(train_days) >= min_train_dates and len(test_days) >= min_test_dates):
         entries = report["holdout"]["quoted_entries"]
-        report["status"] = ("RESEARCH_ONLY_FILL_UNVERIFIED" if
-                            entries["quoted_payoff_per_share_sum"] > 0 and
-                            entries["events_with_quoted_entry"] > 0 else "EDGE_NOT_VALIDATED")
+        if entries["simulated_fills"] > 0:
+            report["status"] = (
+                "RESEARCH_ONLY_EXECUTION_SIMULATED"
+                if entries["simulated_fill_pnl_sum"] > 0
+                else "EDGE_NOT_VALIDATED"
+            )
+        else:
+            report["status"] = (
+                "RESEARCH_ONLY_FILL_UNVERIFIED"
+                if entries["quoted_payoff_per_share_sum"] > 0
+                and entries["events_with_quoted_entry"] > 0
+                else "EDGE_NOT_VALIDATED"
+            )
     return report
 
 
