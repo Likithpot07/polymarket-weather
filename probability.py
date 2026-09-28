@@ -152,6 +152,29 @@ def actual_highs(db: sqlite3.Connection, city: str, station: str,
     """METAR daily maxima are a calibration proxy, never a settlement result."""
     per_day: dict[str, dict[str, float]] = defaultdict(dict)
     today = as_of.astimezone(tz).date()
+
+    # Generic historical station observations populated by calibrate.py.
+    try:
+        historical = db.execute(
+            """SELECT observed_at,temperature_c,fetched_at
+               FROM calibration_observations
+               WHERE city=? AND station=? AND fetched_at<=?""",
+            (city, station, as_of.isoformat()),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        historical = []
+    for observed, temp_c, fetched in historical:
+        try:
+            moment = parse_time(observed)
+            if moment > as_of or moment.astimezone(tz).date() >= today:
+                continue
+            day = moment.astimezone(tz).date().isoformat()
+            per_day[day][moment.isoformat()] = float(temp_c)
+        except (TypeError, ValueError):
+            continue
+
+    # Event-linked observations collected by collector.py. These are merged and
+    # deduplicated so live data can coexist with calibration history.
     for observed, temp, unit, fetched in db.execute("""SELECT o.observed_at,o.temperature,o.unit,o.fetched_at
         FROM observations o JOIN markets m ON o.market_id=m.id
         WHERE m.city=? AND o.station=? AND o.fetched_at<=?""",
@@ -162,7 +185,7 @@ def actual_highs(db: sqlite3.Connection, city: str, station: str,
                 continue
             value = float(temp) if unit == "C" else (float(temp) - 32) * 5 / 9
             day = moment.astimezone(tz).date().isoformat()
-            per_day[day][moment.isoformat()] = value  # deduplicate across brackets
+            per_day[day][moment.isoformat()] = value
         except (TypeError, ValueError):
             continue
     # Incomplete days can badly skew max-temperature calibration.
