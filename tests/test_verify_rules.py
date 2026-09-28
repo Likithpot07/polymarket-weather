@@ -48,6 +48,27 @@ class VerifyRulesTest(unittest.TestCase):
         self.assertEqual(result["rounding"], "whole degree")
         self.assertEqual(result["market_count"], 3)
 
+
+    def test_accepts_celsius_noaa_rule_shape(self):
+        event = valid_event()
+        event["title"] = "Highest temperature in Tokyo on September 28?"
+        event["slug"] = "highest-temperature-in-tokyo-on-september-28-2026"
+        for market in event["markets"]:
+            market["description"] = (
+                market["description"]
+                .replace("LaGuardia Airport", "Tokyo Haneda Airport")
+                .replace("Fahrenheit", "Celsius")
+                .replace("site=KLGA", "site=RJTT")
+            )
+            market["resolutionSource"] = "https://www.weather.gov/wrh/timeseries?site=RJTT"
+        event["markets"][0]["question"] = "Will the highest temperature in Tokyo be 18°C or below on September 28?"
+        event["markets"][1]["question"] = "Will the highest temperature in Tokyo be between 19-20°C on September 28?"
+        event["markets"][2]["question"] = "Will the highest temperature in Tokyo be 21°C or higher on September 28?"
+        result = verify_event_payload(event)
+        self.assertEqual(result["station"], "RJTT")
+        self.assertEqual(result["unit"], "C")
+        self.assertEqual(result["rounding"], "whole degree")
+
     def test_rejects_missing_hourly_data_clause(self):
         event = valid_event()
         for market in event["markets"]:
