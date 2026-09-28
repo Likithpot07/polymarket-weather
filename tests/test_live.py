@@ -2,7 +2,7 @@ import sqlite3
 import unittest
 from datetime import datetime, timezone
 
-from live import LIVE_DDL, persist_snapshot
+from live import LIVE_DDL, persist_candidate_audit, persist_snapshot
 
 
 class LivePersistenceTest(unittest.TestCase):
@@ -69,6 +69,28 @@ class LivePersistenceTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row[0], "CLOSED_SIGNAL")
         self.assertIn("BELOW_MIN_NET_EDGE", row[1])
+
+    def test_candidate_selection_reason_is_persisted(self):
+        no_trade = {**self.trade, "side": "NO"}
+        with self.db:
+            persist_snapshot(self.db, self.state, [no_trade], self.as_of)
+            persist_candidate_audit(
+                self.db,
+                self.state,
+                [no_trade],
+                self.as_of,
+                scheduled_trade=None,
+                allowed=False,
+                gate_reason="CITY_DAY_HEALTHY_POSITION",
+            )
+        row = self.db.execute(
+            """SELECT selected,selection_reason,net_edge
+               FROM paper_candidate_audit"""
+        ).fetchone()
+        self.assertEqual(row[0], 0)
+        self.assertEqual(row[1], "CITY_DAY_HEALTHY_POSITION")
+        self.assertAlmostEqual(row[2], 0.18)
+
 
 
 if __name__ == "__main__":
