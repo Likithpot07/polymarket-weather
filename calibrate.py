@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 import truststore
 
 from collector import DDL
-from probability import calibration, event_markets, parse_time
+from probability import DEFAULT_SIGMA_FLOOR_C, calibration, event_markets, parse_time
 
 truststore.inject_into_ssl()
 
@@ -379,7 +379,7 @@ def main() -> None:
                     args.availability_lag_hours,
                 )
 
-        base_sigma = 2.5 if unit == "C" else 2.5 * 9 / 5
+        sigma_floor = DEFAULT_SIGMA_FLOOR_C if unit == "C" else DEFAULT_SIGMA_FLOOR_C * 9 / 5
         fitted = calibration(
             db,
             city,
@@ -389,7 +389,7 @@ def main() -> None:
             as_of,
             tz,
             args.days,
-            base_sigma,
+            sigma_floor,
         )
         print(
             json.dumps(
