@@ -77,6 +77,24 @@ CREATE TABLE IF NOT EXISTS paper_trades (
 );
 CREATE INDEX IF NOT EXISTS paper_trade_event_time
 ON paper_trades(event_id,opened_at);
+
+CREATE TABLE IF NOT EXISTS paper_candidate_audit (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES live_decision_runs(id),
+    event_id TEXT NOT NULL,
+    market_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    selected INTEGER NOT NULL,
+    selection_reason TEXT NOT NULL,
+    model_probability REAL,
+    best_ask REAL,
+    net_edge REAL,
+    bracket TEXT,
+    UNIQUE(run_id,market_id,side)
+);
+CREATE INDEX IF NOT EXISTS paper_candidate_event_time
+ON paper_candidate_audit(event_id,as_of);
 """
 
 
@@ -233,6 +251,61 @@ def persist_snapshot(
     return new_trades
 
 
+def persist_candidate_audit(
+    db: sqlite3.Connection,
+    state: dict,
+    decisions: list[dict],
+    as_of: datetime,
+    scheduled_trade: dict | None,
+    allowed: bool,
+    gate_reason: str | None,
+) -> None:
+    """Persist why each eligible NO trade candidate was or was not selected."""
+    row = db.execute(
+        """SELECT id FROM live_decision_runs
+           WHERE event_id=? AND as_of=?
+           ORDER BY id DESC LIMIT 1""",
+        (state["event_id"], as_of.isoformat()),
+    ).fetchone()
+    if not row:
+        raise sqlite3.Error("live decision run missing for candidate audit")
+    run_id = int(row[0])
+    current_trades = [
+        d for d in decisions
+        if d.get("action") == "TRADE" and str(d.get("side")).upper() == "NO"
+    ]
+    best = best_no_trade(current_trades)
+    for decision in current_trades:
+        selected = scheduled_trade is decision
+        if selected:
+            reason = "SELECTED_AND_SCHEDULED"
+        elif best is not None and decision is not best:
+            reason = "LOWER_EDGE_THAN_SELECTED_NO"
+        elif not allowed:
+            reason = gate_reason or "CITY_DAY_GATE_BLOCKED"
+        else:
+            reason = "PAPER_ORDER_NOT_SCHEDULED"
+        db.execute(
+            """INSERT OR REPLACE INTO paper_candidate_audit(
+                   run_id,event_id,market_id,side,as_of,selected,selection_reason,
+                   model_probability,best_ask,net_edge,bracket
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                run_id,
+                state["event_id"],
+                decision["market_id"],
+                decision["side"],
+                as_of.isoformat(),
+                int(selected),
+                reason,
+                decision.get("model_probability"),
+                decision.get("best_ask"),
+                decision.get("net_edge"),
+                decision.get("bracket"),
+            ),
+        )
+
+
 def format_trade(decision: dict) -> str:
     ask = decision.get("best_ask")
     depth = decision.get("ask_size")
@@ -286,6 +359,15 @@ def run_cycle(
                     )
                     if order_id:
                         scheduled_trade = best
+                persist_candidate_audit(
+                    db,
+                    state,
+                    decisions,
+                    evaluation_time,
+                    scheduled_trade,
+                    allowed,
+                    gate_reason,
+                )
             summary["events"] += 1
             summary["trade"] += counts.get("TRADE", 0)
             summary["watch"] += counts.get("WATCH", 0)
