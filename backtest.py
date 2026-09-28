@@ -112,7 +112,6 @@ def quote_payoffs(
             and str(row.get("side")).upper() == "NO"
             and row.get("won") in ("0", "1")
             and row.get("entry_cost") not in (None, "")
-            and row.get("best_ask") not in (None, "")
             and str(row.get("depth_verified")) == "True"
         ]
         best = best_no_trade(executable)
@@ -128,7 +127,7 @@ def quote_payoffs(
     simulated_fills = []
     for row in selected:
         raw_levels = row.get("ask_levels_json")
-        if not raw_levels:
+        if not raw_levels or row.get("best_ask") in (None, ""):
             continue
         try:
             ask_levels = json.loads(raw_levels)
