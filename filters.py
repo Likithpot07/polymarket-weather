@@ -55,7 +55,7 @@ def assess(state: dict, outcome: dict, side: str, quote: dict | None,
     result = {"event_id": state["event_id"], "market_id": outcome["market_id"],
               "side": side, "as_of": as_of.isoformat(), "action": "SKIP",
               "reasons": [], "model_probability": outcome["p_yes"] if side == "YES" else outcome["p_no"],
-              "best_bid": None, "best_ask": None, "ask_size": None,
+              "best_bid": None, "best_ask": None, "ask_size": None, "ask_levels": None,
               "book_age_seconds": None, "quote_source": None, "depth_verified": False,
               "raw_edge": None, "fee_per_share": None,
               "slippage_per_share": None, "entry_cost": None, "net_edge": None}
@@ -68,6 +68,7 @@ def assess(state: dict, outcome: dict, side: str, quote: dict | None,
         for key in ("best_bid", "best_ask", "ask_size", "book_age_seconds"):
             result[key] = quote[key]
         result["quote_source"] = quote.get("quote_source")
+        result["ask_levels"] = quote.get("ask_levels")
         result["depth_verified"] = bool(quote.get("depth_verified", quote.get("ask_size") is not None))
         if quote["book_age_seconds"] > policy.max_book_age_seconds:
             hard.append("STALE_BOOK")
