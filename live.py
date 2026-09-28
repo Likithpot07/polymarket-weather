@@ -312,6 +312,21 @@ def run_cycle(
                     f"gate={gate_reason}",
                     flush=True,
                 )
+            if current_trades:
+                best = best_no_trade(current_trades)
+                for decision in current_trades:
+                    if scheduled_trade is decision:
+                        continue
+                    if best is not None and decision is not best:
+                        reason = "LOWER_EDGE_THAN_SELECTED_NO"
+                    elif not allowed:
+                        reason = gate_reason or "CITY_DAY_GATE_BLOCKED"
+                    else:
+                        reason = "PAPER_ORDER_NOT_SCHEDULED"
+                    print(
+                        f"PAPER TRADE SKIPPED | {format_trade(decision)} | reason={reason}",
+                        flush=True,
+                    )
         except (ValueError, sqlite3.Error) as exc:
             summary["errors"] += 1
             print(f"{evaluation_time.isoformat()} | {event_id} | ERROR | {exc}", flush=True)
