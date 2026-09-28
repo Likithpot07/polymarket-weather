@@ -44,7 +44,7 @@ FIELDS = (
 
     "best_bid", "best_ask", "ask_size", "book_age_seconds", "quote_source",
 
-    "depth_verified", "fee_per_share", "slippage_per_share", "entry_cost",
+    "depth_verified", "ask_levels_json", "fee_per_share", "slippage_per_share", "entry_cost",
 
     "net_edge", "rules_verified", "resolved_yes", "won", "label_source_url",
 
@@ -326,6 +326,9 @@ def build(db: sqlite3.Connection, events: list[str], cfg: dict, policy: Policy,
                     "book_age_seconds": d["book_age_seconds"],
                     "quote_source": d["quote_source"],
                     "depth_verified": d["depth_verified"],
+                    "ask_levels_json": json.dumps(
+                        d.get("ask_levels"), separators=(",", ":")
+                    ) if d.get("ask_levels") else "",
                     "fee_per_share": d["fee_per_share"],
                     "slippage_per_share": d["slippage_per_share"],
                     "entry_cost": d["entry_cost"],
