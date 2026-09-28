@@ -151,6 +151,7 @@ class PaperTradingTest(unittest.TestCase):
 
     def test_gamma_outcome_prices_map_to_yes_result(self):
         event = {
+            "closed": True,
             "markets": [
                 {
                     "id": "m1",
@@ -165,6 +166,20 @@ class PaperTradingTest(unittest.TestCase):
             ]
         }
         self.assertEqual(settled_market_results(event), {"m1": 1, "m2": 0})
+
+    def test_gamma_prices_do_not_settle_open_event(self):
+        event = {
+            "closed": False,
+            "markets": [
+                {
+                    "id": "m1",
+                    "outcomes": ["Yes", "No"],
+                    "outcomePrices": ["1", "0"],
+                }
+            ],
+        }
+        self.assertEqual(settled_market_results(event), {})
+
 
 
 if __name__ == "__main__":
