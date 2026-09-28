@@ -87,6 +87,60 @@ def paper_config(cfg: dict) -> dict:
     return result
 
 
+def _finite_float(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def best_no_trade(decisions: list[dict]) -> dict | None:
+    candidates = [
+        decision for decision in decisions
+        if decision.get("action") == "TRADE"
+        and str(decision.get("side")).upper() == "NO"
+    ]
+    if not candidates:
+        return None
+    return max(
+        candidates,
+        key=lambda decision: (
+            _finite_float(decision.get("net_edge"))
+            if _finite_float(decision.get("net_edge")) is not None
+            else float("-inf")
+        ),
+    )
+
+
+def position_deteriorated(
+    entry: dict,
+    decisions: list[dict],
+    probability_drop: float,
+    net_edge_threshold: float,
+) -> bool | None:
+    current = next(
+        (
+            decision for decision in decisions
+            if str(decision.get("market_id")) == str(entry.get("market_id"))
+            and str(decision.get("side")).upper() == str(entry.get("side")).upper()
+        ),
+        None,
+    )
+    if current is None:
+        return None
+    entry_probability = _finite_float(entry.get("model_probability"))
+    current_probability = _finite_float(current.get("model_probability"))
+    current_edge = _finite_float(current.get("net_edge"))
+    probability_bad = (
+        entry_probability is not None
+        and current_probability is not None
+        and current_probability <= entry_probability - probability_drop
+    )
+    edge_bad = current_edge is not None and current_edge <= net_edge_threshold
+    return probability_bad or edge_bad
+
+
 def city_day_gate(
     db: sqlite3.Connection,
     city: str,
@@ -132,29 +186,19 @@ def city_day_gate(
         return False, "CITY_DAY_LOCKED"
 
     market_id, side, entry_probability = latest
-    current = next(
-        (
-            d for d in decisions
-            if str(d.get("market_id")) == str(market_id)
-            and str(d.get("side")).upper() == str(side).upper()
-        ),
-        None,
+    deteriorated = position_deteriorated(
+        {
+            "market_id": market_id,
+            "side": side,
+            "model_probability": entry_probability,
+        },
+        decisions,
+        pcfg["deterioration_probability_drop"],
+        pcfg["deterioration_net_edge"],
     )
-    if not current:
+    if deteriorated is None:
         return False, "LATEST_POSITION_NOT_EVALUATED"
-
-    current_probability = current.get("model_probability")
-    current_edge = current.get("net_edge")
-    probability_bad = (
-        current_probability is not None
-        and float(current_probability)
-        <= float(entry_probability) - pcfg["deterioration_probability_drop"]
-    )
-    edge_bad = (
-        current_edge is not None
-        and float(current_edge) <= pcfg["deterioration_net_edge"]
-    )
-    if probability_bad or edge_bad:
+    if deteriorated:
         return True, "LATEST_POSITION_DETERIORATED"
     return False, "CITY_DAY_HEALTHY_POSITION"
 
@@ -357,6 +401,9 @@ def process_pending_orders(
 
 
 def settled_market_results(event: dict) -> dict[str, int]:
+    closed = event.get("closed")
+    if not (closed is True or str(closed).strip().lower() == "true"):
+        return {}
     results = {}
     for market in event.get("markets") or []:
         outcomes = market.get("outcomes")
