@@ -31,8 +31,7 @@
     "max_book_age_seconds": 10,
     "settlement_check_seconds": 300,
     "max_trades_per_city_day": 3,
-    "deterioration_probability_drop": 0.15,
-    "deterioration_net_edge": 0
+    "deterioration_probability_drop": 0.15
   },
   "decision": {
     "allowed_sides": [
