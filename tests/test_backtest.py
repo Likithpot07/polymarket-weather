@@ -29,6 +29,7 @@ class BacktestTest(unittest.TestCase):
                 "as_of": "2026-09-24T12:00:00Z", "action": "WATCH", "won": "1",
                 "entry_cost": "0.4", "best_ask": "0.4",
                 "ask_levels_json": '[{"price":0.4,"size":30}]',
+                "execution_ask_levels_json": '[{"price":0.4,"size":30}]',
                 "net_edge": "0.5", "depth_verified": "False",
                 "rules_verified": "True", "pre_target_day": "True"}
         self.assertEqual(quote_payoffs([base], {"x"})["events_with_quoted_entry"], 0)
@@ -46,6 +47,7 @@ class BacktestTest(unittest.TestCase):
                 "as_of": "2026-09-24T12:00:00Z", "action": "TRADE", "won": "1",
                 "entry_cost": "0.40", "net_edge": "0.30", "depth_verified": "True",
                 "rules_verified": "True", "pre_target_day": "True",
+                "execution_ask_levels_json": '[{"price":0.40,"size":30}]', "best_ask": "0.40",
             },
             {
                 "event_id": "x", "city": "NYC", "target_date": "2026-09-25",
@@ -53,6 +55,7 @@ class BacktestTest(unittest.TestCase):
                 "as_of": "2026-09-24T12:00:00Z", "action": "TRADE", "won": "0",
                 "entry_cost": "0.50", "net_edge": "0.20", "depth_verified": "True",
                 "rules_verified": "True", "pre_target_day": "True",
+                "execution_ask_levels_json": '[{"price":0.50,"size":30}]', "best_ask": "0.50",
             },
             {
                 "event_id": "x", "city": "NYC", "target_date": "2026-09-25",
@@ -60,6 +63,7 @@ class BacktestTest(unittest.TestCase):
                 "as_of": "2026-09-24T18:00:00Z", "action": "WATCH", "won": "1",
                 "entry_cost": "0.45", "net_edge": "0.02", "depth_verified": "True",
                 "rules_verified": "True", "pre_target_day": "True",
+                "execution_ask_levels_json": '[{"price":0.45,"size":30}]', "best_ask": "0.45",
             },
             {
                 "event_id": "x", "city": "NYC", "target_date": "2026-09-25",
@@ -67,6 +71,7 @@ class BacktestTest(unittest.TestCase):
                 "as_of": "2026-09-24T18:00:00Z", "action": "TRADE", "won": "0",
                 "entry_cost": "0.50", "net_edge": "0.30", "depth_verified": "True",
                 "rules_verified": "True", "pre_target_day": "True",
+                "execution_ask_levels_json": '[{"price":0.50,"size":30}]', "best_ask": "0.50",
             },
         ]
         result = quote_payoffs(rows, {"x"})
@@ -74,6 +79,31 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(result["wins"], 1)
         self.assertAlmostEqual(result["quoted_payoff_per_share_sum"], 0.10)
 
+
+    def test_no_fill_does_not_lock_city_day(self):
+        rows = [
+            {
+                "event_id": "x", "city": "NYC", "target_date": "2026-09-25",
+                "market_id": "m1", "side": "NO", "model_probability": "0.80",
+                "as_of": "2026-09-24T12:00:00Z", "action": "TRADE", "won": "1",
+                "entry_cost": "0.40", "best_ask": "0.40", "net_edge": "0.30",
+                "depth_verified": "True", "rules_verified": "True",
+                "pre_target_day": "True",
+                "execution_ask_levels_json": '[{"price":0.50,"size":30}]',
+            },
+            {
+                "event_id": "x", "city": "NYC", "target_date": "2026-09-25",
+                "market_id": "m2", "side": "NO", "model_probability": "0.79",
+                "as_of": "2026-09-24T18:00:00Z", "action": "TRADE", "won": "1",
+                "entry_cost": "0.40", "best_ask": "0.40", "net_edge": "0.29",
+                "depth_verified": "True", "rules_verified": "True",
+                "pre_target_day": "True",
+                "execution_ask_levels_json": '[{"price":0.40,"size":30}]',
+            },
+        ]
+        result = quote_payoffs(rows, {"x"})
+        self.assertEqual(result["quoted_entries"], 2)
+        self.assertEqual(result["simulated_fills"], 1)
 
     def test_holdout_labels_cannot_change_fitted_shrinkage(self):
         rows = []
