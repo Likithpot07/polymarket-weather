@@ -17,5 +17,6 @@
     "icon_global"
   ],
   "forecast_days": 7,
-  "city_locations": {}
+  "city_locations": {},
+  "live_interval_seconds": 30
 }
