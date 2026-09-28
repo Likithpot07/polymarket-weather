@@ -98,5 +98,35 @@ class InDayObservationTest(unittest.TestCase):
         self.assertNotIn("IN_DAY_OBSERVATIONS_NOT_MODELED", decision["reasons"])
 
 
+class HistoricalCalibrationObservationTest(unittest.TestCase):
+    def test_generic_calibration_observations_feed_actual_highs(self):
+        from probability import actual_highs
+        from zoneinfo import ZoneInfo
+
+        db = sqlite3.connect(":memory:")
+        db.executescript(DDL)
+        fetched = "2026-09-28T06:00:00+00:00"
+        for hour in range(18):
+            observed = f"2026-09-27T{hour:02d}:00:00+00:00"
+            db.execute(
+                """INSERT INTO calibration_observations(
+                       station,city,observed_at,temperature_c,source_url,
+                       source_record_id,fetched_at,raw_json
+                   ) VALUES (?,?,?,?,?,?,?,?)""",
+                ("KLGA", "NYC", observed, 10 + hour / 10, "test",
+                 str(hour), fetched, "{}"),
+            )
+        highs = actual_highs(
+            db,
+            "NYC",
+            "KLGA",
+            ZoneInfo("UTC"),
+            datetime(2026, 9, 28, 7, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(set(highs), {"2026-09-27"})
+        self.assertAlmostEqual(highs["2026-09-27"], 11.7)
+        db.close()
+
+
 if __name__ == "__main__":
     unittest.main()
