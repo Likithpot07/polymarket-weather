@@ -29,7 +29,6 @@ class PaperTradingTest(unittest.TestCase):
                 "settlement_check_seconds": 300,
                 "max_trades_per_city_day": 3,
                 "deterioration_probability_drop": 0.15,
-                "deterioration_net_edge": 0.0,
             }
         }
 
@@ -122,6 +121,31 @@ class PaperTradingTest(unittest.TestCase):
         )
         self.assertTrue(allowed)
         self.assertEqual(reason, "LATEST_POSITION_DETERIORATED")
+
+    def test_negative_current_edge_does_not_reopen_healthy_position(self):
+        self.db.execute(
+            """INSERT INTO paper_orders(
+                   event_id,market_id,side,token_id,bracket,signal_at,execute_after,status,
+                   model_probability,signal_ask,desired_shares,max_price,filled_shares,
+                   vwap,fees,total_cost,fill_at
+               ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                "e1","m1","NO","t1","test",
+                "2026-09-28T08:00:00+00:00","2026-09-28T08:00:01+00:00","FILLED",
+                0.80,0.50,20.0,0.53,20.0,0.50,0.0,10.0,"2026-09-28T08:00:01+00:00"
+            ),
+        )
+        decisions = [{
+            "market_id": "m1",
+            "side": "NO",
+            "model_probability": 0.76,
+            "net_edge": -0.05,
+        }]
+        allowed, reason = city_day_gate(
+            self.db, "NYC", "2026-09-28", decisions, self.cfg
+        )
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "CITY_DAY_HEALTHY_POSITION")
 
     def test_city_day_stops_at_max_trades(self):
         for i in range(3):
