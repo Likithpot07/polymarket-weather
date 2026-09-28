@@ -68,7 +68,6 @@ def paper_config(cfg: dict) -> dict:
         "settlement_check_seconds": float(raw.get("settlement_check_seconds", 300.0)),
         "max_trades_per_city_day": int(raw.get("max_trades_per_city_day", 3)),
         "deterioration_probability_drop": float(raw.get("deterioration_probability_drop", 0.15)),
-        "deterioration_net_edge": float(raw.get("deterioration_net_edge", 0.0)),
     }
     if result["notional_usd"] <= 0:
         raise ValueError("paper.notional_usd must be positive")
@@ -82,8 +81,6 @@ def paper_config(cfg: dict) -> dict:
         raise ValueError("paper.max_trades_per_city_day must be >= 1")
     if not 0 <= result["deterioration_probability_drop"] <= 1:
         raise ValueError("paper.deterioration_probability_drop must be between 0 and 1")
-    if not math.isfinite(result["deterioration_net_edge"]):
-        raise ValueError("paper.deterioration_net_edge must be finite")
     return result
 
 
@@ -117,7 +114,6 @@ def position_deteriorated(
     entry: dict,
     decisions: list[dict],
     probability_drop: float,
-    net_edge_threshold: float,
 ) -> bool | None:
     current = next(
         (
@@ -131,14 +127,12 @@ def position_deteriorated(
         return None
     entry_probability = _finite_float(entry.get("model_probability"))
     current_probability = _finite_float(current.get("model_probability"))
-    current_edge = _finite_float(current.get("net_edge"))
     probability_bad = (
         entry_probability is not None
         and current_probability is not None
         and current_probability <= entry_probability - probability_drop
     )
-    edge_bad = current_edge is not None and current_edge <= net_edge_threshold
-    return probability_bad or edge_bad
+    return probability_bad
 
 
 def city_day_gate(
@@ -194,7 +188,6 @@ def city_day_gate(
         },
         decisions,
         pcfg["deterioration_probability_drop"],
-        pcfg["deterioration_net_edge"],
     )
     if deteriorated is None:
         return False, "LATEST_POSITION_NOT_EVALUATED"
