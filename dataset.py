@@ -339,7 +339,7 @@ def build(db: sqlite3.Connection, events: list[str], cfg: dict, policy: Policy,
 
             produced = len(rows) - before
             print(
-                f"    [{cycle_no}/{len(pre_target_times)}] "
+                f"    [{cycle_no}/{len(decision_times)}] "
                 f"{as_of.isoformat()} -> {produced} row(s) "
                 f"({perf_counter() - cycle_work_started:.2f}s)",
                 flush=True,
