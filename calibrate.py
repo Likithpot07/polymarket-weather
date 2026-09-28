@@ -340,7 +340,7 @@ def main() -> None:
                 f"need {args.days}. Try a smaller --days value or rerun later."
             )
         selected = {day: days[day] for day in selected_dates}
-        fetched_at = datetime.now(timezone.utc).isoformat()
+        fetched_at = as_of.isoformat()
         with db:
             obs_count = save_observations(
                 db, city, station, selected, fetched_at
