@@ -5,13 +5,13 @@ import argparse
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 import json
-from math import erf, sqrt
+from math import erf, erfc, sqrt
 from pathlib import Path
 import re
 import sqlite3
 from zoneinfo import ZoneInfo
 
-VERSION = "baseline-mixture-v1"
+VERSION = "baseline-mixture-v2-observed-floor"
 DDL = """
 CREATE TABLE IF NOT EXISTS probability_runs (
     id INTEGER PRIMARY KEY, event_id TEXT NOT NULL, as_of TEXT NOT NULL,
@@ -96,6 +96,44 @@ def to_unit(temp_c: float, unit: str) -> float:
     return temp_c if unit == "C" else temp_c * 9 / 5 + 32
 
 
+def in_day_observed_high(db: sqlite3.Connection, eid: str, station: str | None,
+                         target: str, unit: str, tz: ZoneInfo,
+                         as_of: datetime) -> dict | None:
+    """Latest known target-day METAR maximum, deduplicated across bracket markets."""
+    if not station or as_of.astimezone(tz).date() != date.fromisoformat(target):
+        return None
+    readings: dict[str, tuple[datetime, float]] = {}
+    for observed, temp, stored_unit, fetched, record_id in db.execute(
+        """SELECT o.observed_at,o.temperature,o.unit,o.fetched_at,o.source_record_id
+           FROM observations o JOIN markets m ON o.market_id=m.id
+           WHERE m.event_id=? AND o.station=? AND o.fetched_at<=?""",
+        (eid, station, as_of.isoformat()),
+    ):
+        try:
+            moment = parse_time(observed)
+            if moment > as_of or moment.astimezone(tz).date().isoformat() != target:
+                continue
+            value = float(temp)
+            value_c = value if stored_unit == "C" else (value - 32) * 5 / 9
+            converted = to_unit(value_c, unit)
+            key = str(record_id or moment.isoformat())
+            readings[key] = (moment, converted)
+        except (TypeError, ValueError):
+            continue
+    if not readings:
+        return None
+    values = list(readings.values())
+    latest = max(moment for moment, _ in values)
+    return {
+        "station": station,
+        "high": max(value for _, value in values),
+        "unit": unit,
+        "latest_observed_at": latest.isoformat(),
+        "reading_count": len(values),
+        "source": "AviationWeather METAR proxy",
+    }
+
+
 def latest_forecasts(db: sqlite3.Connection, city: str, target: str, as_of: datetime):
     """Use fetched_at, never a later model value for an earlier decision."""
     rows = db.execute("""SELECT b.model,b.fetched_at,v.temperature_c,b.id
@@ -166,11 +204,47 @@ def cdf(x: float, mean: float, sigma: float) -> float:
     return (1 + erf((x - mean) / (sigma * sqrt(2)))) / 2
 
 
+def survival(x: float, mean: float, sigma: float) -> float:
+    return 0.5 * erfc((x - mean) / (sigma * sqrt(2)))
+
+
+def interval_probability(lower: float | None, upper: float | None,
+                         mean: float, sigma: float) -> float:
+    if lower is None:
+        return cdf(upper, mean, sigma) if upper is not None else 1.0
+    if upper is None:
+        return survival(lower, mean, sigma)
+    if lower >= upper:
+        return 0.0
+    if lower > mean:
+        return max(0.0, survival(lower, mean, sigma) - survival(upper, mean, sigma))
+    return max(0.0, cdf(upper, mean, sigma) - cdf(lower, mean, sigma))
+
+
 def probability(lo: int | None, hi: int | None, mean: float, sigma: float) -> float:
     # Assumes settlement values are rounded to nearest whole unit.
-    lower = 0.0 if lo is None else cdf(lo - 0.5, mean, sigma)
-    upper = 1.0 if hi is None else cdf(hi + 0.5, mean, sigma)
-    return max(0.0, upper - lower)
+    lower = None if lo is None else lo - 0.5
+    upper = None if hi is None else hi + 0.5
+    return interval_probability(lower, upper, mean, sigma)
+
+
+def observed_floor_probability(lo: int | None, hi: int | None, components: list[dict],
+                               observed_high: float) -> float:
+    """Condition the mixture on the final daily maximum being at least the observed high."""
+    numerator = 0.0
+    denominator = 0.0
+    lower = None if lo is None else lo - 0.5
+    upper = None if hi is None else hi + 0.5
+    for component in components:
+        mean = float(component["mean"])
+        sigma = float(component["sigma"])
+        survival_mass = survival(observed_high, mean, sigma)
+        denominator += survival_mass
+        effective_lower = observed_high if lower is None else max(lower, observed_high)
+        numerator += interval_probability(effective_lower, upper, mean, sigma)
+    if denominator <= 0:
+        raise ValueError("Observed high is outside the numerical support of every weather model")
+    return max(0.0, min(1.0, numerator / denominator))
 
 
 def evaluate(db: sqlite3.Connection, eid: str, as_of: datetime,
@@ -196,9 +270,13 @@ def evaluate(db: sqlite3.Connection, eid: str, as_of: datetime,
                            "sigma": fit["sigma"] if fit else base_sigma,
                            "calibration_days": fit["days"] if fit else 0,
                            "fetched_at": item["fetched_at"], "batch_id": item["batch_id"]})
+    observed = in_day_observed_high(db, eid, station, target, unit, tz, as_of)
     probs = []
     for mid, label, lo, hi, _ in bins:
-        p = sum(probability(lo, hi, c["mean"], c["sigma"]) for c in components) / len(components)
+        if observed:
+            p = observed_floor_probability(lo, hi, components, observed["high"])
+        else:
+            p = sum(probability(lo, hi, c["mean"], c["sigma"]) for c in components) / len(components)
         probs.append({"market_id": mid, "bracket": label, "p_yes": p, "p_no": 1 - p})
     total = sum(p["p_yes"] for p in probs)
     if abs(total - 1) > 1e-8:
@@ -208,12 +286,17 @@ def evaluate(db: sqlite3.Connection, eid: str, as_of: datetime,
         reasons.append("resolution rules not manually verified")
     if len(trained) != len(components):
         reasons.append("some models lack enough historical station days; fallback spread used")
+    if observed:
+        reasons.append("target-day METAR high used as a lower-bound condition on the forecast mixture")
     reasons.append("METAR maximum may differ from official finalized resolution temperature")
     reasons.append("forecast coordinates may differ from resolution station")
     reasons.append("nearest-whole-degree rounding assumed")
     result = {"event_id": eid, "city": city, "target_date": target, "unit": unit,
               "station": station, "as_of": as_of.isoformat(), "status": "provisional",
-              "notes": reasons, "components": components, "probabilities": probs}
+              "notes": reasons, "components": components,
+              "in_day_observation": observed,
+              "in_day_observations_modeled": bool(observed),
+              "probabilities": probs}
     if persist:
         with db:
             cursor = db.execute("""INSERT INTO probability_runs
@@ -222,7 +305,9 @@ def evaluate(db: sqlite3.Connection, eid: str, as_of: datetime,
                 (eid, as_of.isoformat(), datetime.now(timezone.utc).isoformat(), VERSION,
                  city, target, unit, station, result["status"], json.dumps({
                      "notes": reasons, "components": components, "min_calibration_days": min_days,
-                     "fallback_sigma_c": fallback_sigma_c})))
+                     "fallback_sigma_c": fallback_sigma_c,
+                     "in_day_observation": observed,
+                     "in_day_observations_modeled": bool(observed)})))
             result["run_id"] = cursor.lastrowid
             db.executemany("INSERT INTO bracket_probabilities VALUES (?,?,?,?,?)",
                            [(cursor.lastrowid, p["market_id"], p["bracket"], p["p_yes"], p["p_no"])
