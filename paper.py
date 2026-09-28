@@ -263,7 +263,7 @@ def process_pending_orders(
            ORDER BY execute_after,id""",
         (as_of.isoformat(),),
     ).fetchall()
-    fills_out = []
+    results_out = []
     for row in rows:
         (order_id, token, execute_after, desired, max_price, event_id,
          market_id, side, bracket, signal_ask) = row
@@ -271,12 +271,23 @@ def process_pending_orders(
         history = book_history(db, {str(token)}).get(str(token), [])
         quote = quoted_book(history, execution_time, pcfg["max_book_age_seconds"])
         if not quote or not quote.get("depth_verified") or not quote.get("ask_levels"):
+            reason = "NO_VERIFIED_BOOK_AT_EXECUTION"
             db.execute(
                 """UPDATE paper_orders
                    SET status='NO_FILL',last_error=?,fill_at=?
                    WHERE id=?""",
-                ("NO_VERIFIED_BOOK_AT_EXECUTION", execution_time.isoformat(), order_id),
+                (reason, execution_time.isoformat(), order_id),
             )
+            results_out.append({
+                "order_id": order_id,
+                "event_id": str(event_id),
+                "market_id": str(market_id),
+                "side": str(side),
+                "bracket": bracket,
+                "signal_ask": float(signal_ask),
+                "status": "NO_FILL",
+                "reason": reason,
+            })
             continue
         result = simulate_buy_fill(
             quote["ask_levels"],
@@ -286,19 +297,32 @@ def process_pending_orders(
         )
         filled = result["filled_shares"]
         if filled <= 0:
+            reason = "PRICE_MOVED_BEYOND_SLIPPAGE_LIMIT_OR_NO_DEPTH"
             db.execute(
                 """UPDATE paper_orders
                    SET status='NO_FILL',last_error=?,fill_at=?,book_age_seconds=?,
                        available_depth=?
                    WHERE id=?""",
                 (
-                    "PRICE_MOVED_BEYOND_SLIPPAGE_LIMIT_OR_NO_DEPTH",
+                    reason,
                     execution_time.isoformat(),
                     quote.get("book_age_seconds"),
                     result["available_depth"],
                     order_id,
                 ),
             )
+            results_out.append({
+                "order_id": order_id,
+                "event_id": str(event_id),
+                "market_id": str(market_id),
+                "side": str(side),
+                "bracket": bracket,
+                "signal_ask": float(signal_ask),
+                "status": "NO_FILL",
+                "reason": reason,
+                "book_age_seconds": quote.get("book_age_seconds"),
+                "available_depth": result["available_depth"],
+            })
             continue
         status = "FILLED" if result["remaining_shares"] <= 1e-9 else "PARTIAL"
         db.execute(
@@ -318,7 +342,7 @@ def process_pending_orders(
                 order_id,
             ),
         )
-        fills_out.append({
+        results_out.append({
             "order_id": order_id,
             "event_id": str(event_id),
             "market_id": str(market_id),
@@ -329,7 +353,7 @@ def process_pending_orders(
             "status": status,
         })
     db.commit()
-    return fills_out
+    return results_out
 
 
 def settled_market_results(event: dict) -> dict[str, int]:
