@@ -87,6 +87,18 @@ CREATE TABLE IF NOT EXISTS observations (
  fetched_at TEXT NOT NULL, raw_json TEXT NOT NULL);
 CREATE UNIQUE INDEX IF NOT EXISTS observation_unique
 ON observations(market_id,station,observed_at,source_record_id);
+CREATE TABLE IF NOT EXISTS calibration_observations (
+ station TEXT NOT NULL,
+ city TEXT NOT NULL,
+ observed_at TEXT NOT NULL,
+ temperature_c REAL NOT NULL,
+ source_url TEXT NOT NULL,
+ source_record_id TEXT,
+ fetched_at TEXT NOT NULL,
+ raw_json TEXT NOT NULL,
+ PRIMARY KEY(station,city,observed_at));
+CREATE INDEX IF NOT EXISTS calibration_obs_station_time
+ON calibration_observations(station,city,observed_at);
 """
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
