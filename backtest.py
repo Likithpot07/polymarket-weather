@@ -8,6 +8,8 @@ import json
 import math
 from pathlib import Path
 
+from paper import best_no_trade, position_deteriorated
+
 
 def complete_events(rows: list[dict]) -> tuple[dict[str, list[dict]], Counter]:
     """One latest pre-target snapshot per event, with every bracket labeled."""
@@ -54,24 +56,84 @@ def fit_shrinkage(events: list[list[dict]]) -> float:
                key=lambda a: (sum(event_brier(e, a) for e in events), a))
 
 
-def quote_payoffs(rows: list[dict], event_ids: set[str]) -> dict:
-    """At most one earliest permitted entry per event; no fill is presumed."""
-    trades: dict[str, dict] = {}
-    for r in sorted(rows, key=lambda x: (x["as_of"], x["event_id"],
-                                         -float(x["net_edge"] or 0))):
-        eid = r["event_id"]
-        if (eid in event_ids and eid not in trades and r["action"] == "TRADE"
-                and r["won"] in ("0", "1") and r["entry_cost"]
-                and r["depth_verified"] == "True" and r["rules_verified"] == "True"
-                and r["pre_target_day"] == "True"):
-            trades[eid] = r
-    payoffs = [int(r["won"]) - float(r["entry_cost"]) for r in trades.values()]
-    return {"events_with_quoted_entry": len(trades),
-            "wins": sum(int(r["won"]) for r in trades.values()),
-            "quoted_payoff_per_share_sum": round(sum(payoffs), 6),
-            "quoted_payoff_per_share_mean": round(sum(payoffs) / len(payoffs), 6) if payoffs else None,
-            "fill_assumption": "one share at recorded ask; no actual fills recorded"}
+def quote_payoffs(
+    rows: list[dict],
+    event_ids: set[str],
+    max_trades_per_city_day: int = 3,
+    deterioration_probability_drop: float = 0.15,
+    deterioration_net_edge: float = 0.0,
+) -> dict:
+    """Replay live-like NO selection; execution remains a quote proxy without historical L2."""
+    snapshots: dict[tuple[str, str, str, str], list[dict]] = defaultdict(list)
+    for row in rows:
+        if row.get("event_id") not in event_ids:
+            continue
+        if str(row.get("rules_verified")) != "True":
+            continue
+        key = (
+            str(row.get("as_of") or ""),
+            str(row.get("city") or row.get("event_id") or ""),
+            str(row.get("target_date") or ""),
+            str(row.get("event_id") or ""),
+        )
+        snapshots[key].append(row)
 
+    entries_by_city_day: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    selected: list[dict] = []
+
+    for snapshot_key in sorted(snapshots):
+        _, city, target_date, _ = snapshot_key
+        decisions = snapshots[snapshot_key]
+        city_day = (city, target_date)
+        prior = entries_by_city_day[city_day]
+
+        if not prior:
+            allowed = True
+        elif len(prior) >= max_trades_per_city_day:
+            allowed = False
+        else:
+            deteriorated = position_deteriorated(
+                prior[-1],
+                decisions,
+                deterioration_probability_drop,
+                deterioration_net_edge,
+            )
+            allowed = bool(deteriorated)
+
+        if not allowed:
+            continue
+
+        executable = [
+            row for row in decisions
+            if row.get("action") == "TRADE"
+            and str(row.get("side")).upper() == "NO"
+            and row.get("won") in ("0", "1")
+            and row.get("entry_cost") not in (None, "")
+            and str(row.get("depth_verified")) == "True"
+        ]
+        best = best_no_trade(executable)
+        if best is None:
+            continue
+        prior.append(best)
+        selected.append(best)
+
+    payoffs = [int(row["won"]) - float(row["entry_cost"]) for row in selected]
+    return {
+        "events_with_quoted_entry": len({row["event_id"] for row in selected}),
+        "city_days_with_quoted_entry": len({
+            (row.get("city") or row["event_id"], row.get("target_date") or "")
+            for row in selected
+        }),
+        "quoted_entries": len(selected),
+        "target_day_entries": sum(str(row.get("pre_target_day")) == "False" for row in selected),
+        "wins": sum(int(row["won"]) for row in selected),
+        "quoted_payoff_per_share_sum": round(sum(payoffs), 6),
+        "quoted_payoff_per_share_mean": round(sum(payoffs) / len(payoffs), 6) if payoffs else None,
+        "fill_assumption": (
+            "live-like selection; one share at recorded entry_cost; "
+            "historical L2 fill replay unavailable"
+        ),
+    }
 
 def reliability(events: list[list[dict]], alpha: float) -> list[dict]:
     bins: dict[int, list[tuple[float, int]]] = defaultdict(list)
