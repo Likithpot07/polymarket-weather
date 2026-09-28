@@ -8,7 +8,7 @@ import json
 import math
 from pathlib import Path
 
-from paper import best_no_trade, position_deteriorated
+from paper import best_no_trade, position_deteriorated, simulate_buy_fill
 
 
 def complete_events(rows: list[dict]) -> tuple[dict[str, list[dict]], Counter]:
@@ -62,8 +62,11 @@ def quote_payoffs(
     max_trades_per_city_day: int = 3,
     deterioration_probability_drop: float = 0.15,
     deterioration_net_edge: float = 0.0,
+    notional_usd: float = 10.0,
+    max_slippage_per_share: float = 0.03,
+    weather_fee_rate: float = 0.05,
 ) -> dict:
-    """Replay live-like NO selection; execution remains a quote proxy without historical L2."""
+    """Replay live-like NO selection and reuse live fill simulation when L2 is available."""
     snapshots: dict[tuple[str, str, str, str], list[dict]] = defaultdict(list)
     for row in rows:
         if row.get("event_id") not in event_ids:
@@ -109,6 +112,7 @@ def quote_payoffs(
             and str(row.get("side")).upper() == "NO"
             and row.get("won") in ("0", "1")
             and row.get("entry_cost") not in (None, "")
+            and row.get("best_ask") not in (None, "")
             and str(row.get("depth_verified")) == "True"
         ]
         best = best_no_trade(executable)
@@ -117,7 +121,39 @@ def quote_payoffs(
         prior.append(best)
         selected.append(best)
 
-    payoffs = [int(row["won"]) - float(row["entry_cost"]) for row in selected]
+    quote_payoffs_per_share = [
+        int(row["won"]) - float(row["entry_cost"])
+        for row in selected
+    ]
+    simulated_fills = []
+    for row in selected:
+        raw_levels = row.get("ask_levels_json")
+        if not raw_levels:
+            continue
+        try:
+            ask_levels = json.loads(raw_levels)
+            ask = float(row["best_ask"])
+            desired_shares = notional_usd / ask
+            fill = simulate_buy_fill(
+                ask_levels,
+                desired_shares,
+                min(0.999, ask + max_slippage_per_share),
+                weather_fee_rate,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if fill["filled_shares"] <= 0:
+            continue
+        payout = fill["filled_shares"] if int(row["won"]) else 0.0
+        simulated_fills.append({
+            "event_id": row["event_id"],
+            "market_id": row["market_id"],
+            "filled_shares": fill["filled_shares"],
+            "total_cost": fill["total_cost"],
+            "payout": payout,
+            "pnl": payout - fill["total_cost"],
+        })
+
     return {
         "events_with_quoted_entry": len({row["event_id"] for row in selected}),
         "city_days_with_quoted_entry": len({
@@ -127,11 +163,17 @@ def quote_payoffs(
         "quoted_entries": len(selected),
         "target_day_entries": sum(str(row.get("pre_target_day")) == "False" for row in selected),
         "wins": sum(int(row["won"]) for row in selected),
-        "quoted_payoff_per_share_sum": round(sum(payoffs), 6),
-        "quoted_payoff_per_share_mean": round(sum(payoffs) / len(payoffs), 6) if payoffs else None,
+        "quoted_payoff_per_share_sum": round(sum(quote_payoffs_per_share), 6),
+        "quoted_payoff_per_share_mean": (
+            round(sum(quote_payoffs_per_share) / len(quote_payoffs_per_share), 6)
+            if quote_payoffs_per_share else None
+        ),
+        "simulated_fills": len(simulated_fills),
+        "simulated_fill_pnl_sum": round(sum(fill["pnl"] for fill in simulated_fills), 6),
+        "simulated_fill_cost_sum": round(sum(fill["total_cost"] for fill in simulated_fills), 6),
         "fill_assumption": (
-            "live-like selection; one share at recorded entry_cost; "
-            "historical L2 fill replay unavailable"
+            "live simulate_buy_fill used when full L2 ask levels are present; "
+            "quote-only entries remain execution-unverified"
         ),
     }
 
