@@ -1,10 +1,11 @@
 import sqlite3
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 
 from collector import DDL, save_event
 from filters import Policy, assess
-from probability import DDL as PROBABILITY_DDL, evaluate
+from probability import DDL as PROBABILITY_DDL, calibration, evaluate
 
 
 class InDayObservationTest(unittest.TestCase):
@@ -27,7 +28,7 @@ class InDayObservationTest(unittest.TestCase):
         })
         self.db.execute("INSERT INTO locations VALUES ('NYC',40,-73,'America/New_York','test','{}')")
         self.db.execute("UPDATE rule_reviews SET station='KLGA',unit='F',verified=1")
-        for i, (model, temp_c) in enumerate((("ecmwf_ifs025", 16.0), ("gfs_global", 15.5), ("icon_global", 16.5)), 1):
+        for i, (model, temp_c) in enumerate((("ecmwf_ifs025", 23.0), ("gfs_global", 22.5), ("icon_global", 23.5)), 1):
             self.db.execute(
                 """INSERT INTO forecast_batches
                    (id,city,model,fetched_at,model_run_at,endpoint,raw_json)
@@ -37,6 +38,10 @@ class InDayObservationTest(unittest.TestCase):
             self.db.execute(
                 "INSERT INTO forecast_values VALUES (?, 'daily_max', '2026-09-28', ?)",
                 (i, temp_c),
+            )
+            self.db.execute(
+                "INSERT INTO forecast_values VALUES (?, 'hourly', '2026-09-28T12:00:00-04:00', ?)",
+                (i, 20.0),
             )
         for market_id in ("low", "mid", "high"):
             self.db.execute(
@@ -66,6 +71,11 @@ class InDayObservationTest(unittest.TestCase):
         self.assertEqual(probs["low"], 0.0)
         self.assertEqual(probs["mid"], 0.0)
         self.assertAlmostEqual(sum(probs.values()), 1.0, places=10)
+        self.assertTrue(all(c["mean"] < c["daily_mean"] for c in state["components"]))
+        self.assertTrue(all(
+            c["in_day_mean_source"] == "observed_high_plus_remaining_hourly"
+            for c in state["components"]
+        ))
 
     def test_target_day_warning_removed_when_observation_is_modeled(self):
         state = evaluate(
@@ -96,6 +106,32 @@ class InDayObservationTest(unittest.TestCase):
             "America/New_York", True, policy,
         )
         self.assertNotIn("IN_DAY_OBSERVATIONS_NOT_MODELED", decision["reasons"])
+
+
+class SigmaCalibrationTest(unittest.TestCase):
+    def test_calibrated_sigma_can_be_lower_than_fallback_but_not_floor(self):
+        db = sqlite3.connect(":memory:")
+        actual = {"2026-09-20": 10.0, "2026-09-21": 11.0}
+        forecasts = [
+            {"model": {"temperature_c": 9.8, "fetched_at": "x", "batch_id": 1}},
+            {"model": {"temperature_c": 10.9, "fetched_at": "x", "batch_id": 2}},
+        ]
+        with patch("probability.actual_highs", return_value=actual), patch(
+            "probability.latest_forecasts", side_effect=forecasts
+        ):
+            fitted = calibration(
+                db,
+                "NYC",
+                "KLGA",
+                "C",
+                "2026-09-28",
+                datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc),
+                __import__("zoneinfo").ZoneInfo("UTC"),
+                2,
+                1.5,
+            )
+        self.assertAlmostEqual(fitted["model"]["sigma"], 1.5)
+        db.close()
 
 
 class HistoricalCalibrationObservationTest(unittest.TestCase):
