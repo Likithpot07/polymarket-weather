@@ -11,6 +11,7 @@ import re
 import sqlite3
 import time
 import socket
+import sys
 from http.client import IncompleteRead
 import dns.resolver
 from zoneinfo import ZoneInfo
@@ -607,6 +608,31 @@ async def stream_books(db: sqlite3.Connection, tokens: set[str]) -> None:
             LOG.warning("CLOB disconnected (%s); retrying in %ss", exc, delay)
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
+
+async def run_auto_prepare(cfg: dict) -> None:
+    """Run slow rule verification/calibration in a separate process so collection never blocks."""
+    script = Path(__file__).resolve().with_name("auto_prepare.py")
+    config_path = str(cfg.get("_config_path") or Path(__file__).resolve().with_name("config.json"))
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(script),
+        "--config",
+        config_path,
+    )
+    try:
+        code = await process.wait()
+        if code:
+            LOG.warning("AUTO PREP exited with code %s", code)
+    except asyncio.CancelledError:
+        if process.returncode is None:
+            process.terminate()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=5)
+            except asyncio.TimeoutError:
+                process.kill()
+                await process.wait()
+        raise
+
 async def collect(
     db: sqlite3.Connection,
     cfg: dict,
@@ -614,9 +640,11 @@ async def collect(
     once: bool,
 ) -> None:
     ws_task = None
+    prep_task = None
     current: set[str] = set()
     last_forecast = 0.0
     last_observation = 0.0
+    last_prepare = 0.0
     try:
         while True:
             # 1. Discover active Polymarket weather markets/tokens.
@@ -662,6 +690,21 @@ async def collect(
             ):
                 await collect_forecasts(db, cfg)
                 last_forecast = time.monotonic()
+            # 5. Verify rules + calibrate newly discovered events in a background process.
+            now = time.monotonic()
+            prepare_interval = float(cfg.get("prepare_interval_seconds", 900))
+            if (
+                cfg.get("auto_prepare", True)
+                and (prep_task is None or prep_task.done())
+                and now - last_prepare >= prepare_interval
+            ):
+                if prep_task is not None:
+                    try:
+                        await prep_task
+                    except Exception as exc:
+                        LOG.warning("AUTO PREP task failed: %s", exc)
+                prep_task = asyncio.create_task(run_auto_prepare(cfg))
+                last_prepare = time.monotonic()
             # Short test mode. Runtime starts after initial refreshes.
             if seconds is not None:
                 LOG.info(
@@ -670,11 +713,14 @@ async def collect(
                 )
                 await asyncio.sleep(seconds)
                 return
-            # 5. Normal continuous mode.
+            # 6. Normal continuous mode.
             await asyncio.sleep(
                 cfg["scan_interval_seconds"]
             )
     finally:
+        if prep_task:
+            prep_task.cancel()
+            await asyncio.gather(prep_task, return_exceptions=True)
         if ws_task:
             ws_task.cancel()
             await asyncio.gather(
@@ -710,6 +756,7 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     config_path = Path(args.config).resolve()
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    cfg["_config_path"] = str(config_path)
     if args.event_id and args.command == "collect":
         cfg["event_ids"] = list(dict.fromkeys([*cfg.get("event_ids", []), *args.event_id]))
     db_path = Path(cfg["db_path"])
