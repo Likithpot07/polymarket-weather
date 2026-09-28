@@ -26,7 +26,11 @@ from zoneinfo import ZoneInfo
 
 from decide import event_decisions, verified_at
 
+from edge import book_history, quoted_book
+
 from filters import Policy
+
+from paper import paper_config
 
 from probability import VERSION, parse_time
 
@@ -44,7 +48,9 @@ FIELDS = (
 
     "best_bid", "best_ask", "ask_size", "book_age_seconds", "quote_source",
 
-    "depth_verified", "ask_levels_json", "fee_per_share", "slippage_per_share", "entry_cost",
+    "depth_verified", "ask_levels_json", "execution_best_ask",
+    "execution_book_age_seconds", "execution_depth_verified", "execution_ask_levels_json",
+    "fee_per_share", "slippage_per_share", "entry_cost",
 
     "net_edge", "rules_verified", "resolved_yes", "won", "label_source_url",
 
@@ -255,6 +261,17 @@ def build(db: sqlite3.Connection, events: list[str], cfg: dict, policy: Policy,
             (eid,),
         ).fetchall()
 
+        token_ids = {
+            str(row[0]) for row in db.execute(
+                """SELECT t.token_id FROM tokens t
+                   JOIN markets m ON m.id=t.market_id
+                   WHERE m.event_id=?""",
+                (eid,),
+            )
+        }
+        histories = book_history(db, token_ids) if token_ids else {}
+        pcfg = paper_config(cfg)
+
         end_day = datetime.combine(
             date.fromisoformat(target) + timedelta(days=1),
             time.min,
@@ -297,8 +314,20 @@ def build(db: sqlite3.Connection, events: list[str], cfg: dict, policy: Policy,
                 verified_at(flag, reviewed, as_of)
                 for flag, reviewed in rule_rows
             )
+            execution_time = as_of + timedelta(milliseconds=pcfg["latency_ms"])
 
             for d in decisions:
+                token_id = str(d["token_id"])
+                execution_quote = quoted_book(
+                    histories.get(token_id, []),
+                    execution_time,
+                    pcfg["max_book_age_seconds"],
+                )
+                execution_depth_verified = bool(
+                    execution_quote
+                    and execution_quote.get("depth_verified")
+                    and execution_quote.get("ask_levels")
+                )
                 label = event_labels.get(d["market_id"])
                 won = (
                     label["yes_result"]
@@ -329,6 +358,18 @@ def build(db: sqlite3.Connection, events: list[str], cfg: dict, policy: Policy,
                     "ask_levels_json": json.dumps(
                         d.get("ask_levels"), separators=(",", ":")
                     ) if d.get("ask_levels") else "",
+                    "execution_best_ask": (
+                        execution_quote.get("best_ask")
+                        if execution_quote else None
+                    ),
+                    "execution_book_age_seconds": (
+                        execution_quote.get("book_age_seconds")
+                        if execution_quote else None
+                    ),
+                    "execution_depth_verified": execution_depth_verified,
+                    "execution_ask_levels_json": json.dumps(
+                        execution_quote.get("ask_levels"), separators=(",", ":")
+                    ) if execution_depth_verified else "",
                     "fee_per_share": d["fee_per_share"],
                     "slippage_per_share": d["slippage_per_share"],
                     "entry_cost": d["entry_cost"],
