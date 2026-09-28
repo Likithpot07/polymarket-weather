@@ -24,12 +24,51 @@ class BacktestTest(unittest.TestCase):
         db.close()
 
     def test_quote_payoff_does_not_count_watch_or_assume_fill(self):
-        base = {"event_id": "x", "as_of": "2026-09-24T12:00:00Z",
-                "action": "WATCH", "won": "1", "entry_cost": "0.4", "net_edge": "0.5",
-                "depth_verified": "False", "rules_verified": "True", "pre_target_day": "True"}
+        base = {"event_id": "x", "city": "NYC", "target_date": "2026-09-25",
+                "market_id": "m1", "side": "NO", "model_probability": "0.8",
+                "as_of": "2026-09-24T12:00:00Z", "action": "WATCH", "won": "1",
+                "entry_cost": "0.4", "net_edge": "0.5", "depth_verified": "False",
+                "rules_verified": "True", "pre_target_day": "True"}
         self.assertEqual(quote_payoffs([base], {"x"})["events_with_quoted_entry"], 0)
         trade = {**base, "action": "TRADE", "depth_verified": "True"}
         self.assertAlmostEqual(quote_payoffs([base, trade], {"x"})["quoted_payoff_per_share_sum"], .6)
+
+    def test_quote_payoff_replays_live_deterioration_gate(self):
+        rows = [
+            {
+                "event_id": "x", "city": "NYC", "target_date": "2026-09-25",
+                "market_id": "m1", "side": "NO", "model_probability": "0.80",
+                "as_of": "2026-09-24T12:00:00Z", "action": "TRADE", "won": "1",
+                "entry_cost": "0.40", "net_edge": "0.30", "depth_verified": "True",
+                "rules_verified": "True", "pre_target_day": "True",
+            },
+            {
+                "event_id": "x", "city": "NYC", "target_date": "2026-09-25",
+                "market_id": "m2", "side": "NO", "model_probability": "0.75",
+                "as_of": "2026-09-24T12:00:00Z", "action": "TRADE", "won": "0",
+                "entry_cost": "0.50", "net_edge": "0.20", "depth_verified": "True",
+                "rules_verified": "True", "pre_target_day": "True",
+            },
+            {
+                "event_id": "x", "city": "NYC", "target_date": "2026-09-25",
+                "market_id": "m1", "side": "NO", "model_probability": "0.60",
+                "as_of": "2026-09-24T18:00:00Z", "action": "WATCH", "won": "1",
+                "entry_cost": "0.45", "net_edge": "0.02", "depth_verified": "True",
+                "rules_verified": "True", "pre_target_day": "True",
+            },
+            {
+                "event_id": "x", "city": "NYC", "target_date": "2026-09-25",
+                "market_id": "m2", "side": "NO", "model_probability": "0.80",
+                "as_of": "2026-09-24T18:00:00Z", "action": "TRADE", "won": "0",
+                "entry_cost": "0.50", "net_edge": "0.30", "depth_verified": "True",
+                "rules_verified": "True", "pre_target_day": "True",
+            },
+        ]
+        result = quote_payoffs(rows, {"x"})
+        self.assertEqual(result["quoted_entries"], 2)
+        self.assertEqual(result["wins"], 1)
+        self.assertAlmostEqual(result["quoted_payoff_per_share_sum"], 0.10)
+
 
     def test_holdout_labels_cannot_change_fitted_shrinkage(self):
         rows = []
