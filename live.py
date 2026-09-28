@@ -79,16 +79,30 @@ ON paper_trades(event_id,opened_at);
 """
 
 
-def active_event_ids(db: sqlite3.Connection) -> list[str]:
+def active_event_ids(db: sqlite3.Connection, as_of: datetime) -> list[str]:
+    """Return only events whose target day has not passed in that city's timezone."""
     rows = db.execute(
-        """SELECT DISTINCT event_id
-           FROM markets
-           WHERE active=1
-             AND city IS NOT NULL
-             AND target_date IS NOT NULL
-           ORDER BY target_date,event_id"""
+        """SELECT DISTINCT m.event_id,m.target_date,l.timezone
+           FROM markets m
+           LEFT JOIN locations l ON l.city=m.city
+           WHERE m.active=1
+             AND m.city IS NOT NULL
+             AND m.target_date IS NOT NULL
+           ORDER BY m.target_date,m.event_id"""
     ).fetchall()
-    return [str(row[0]) for row in rows]
+    result = []
+    for event_id, target_date, timezone_name in rows:
+        if not timezone_name:
+            continue
+        try:
+            from datetime import date
+            from zoneinfo import ZoneInfo
+            local_day = as_of.astimezone(ZoneInfo(str(timezone_name))).date()
+            if local_day <= date.fromisoformat(str(target_date)):
+                result.append(str(event_id))
+        except (ValueError, TypeError):
+            continue
+    return result
 
 
 def persist_snapshot(
@@ -239,7 +253,7 @@ def run_cycle(
     event_ids: list[str] | None,
     as_of: datetime,
 ) -> dict:
-    ids = event_ids or active_event_ids(db)
+    ids = event_ids or active_event_ids(db, as_of)
     summary = {"events": 0, "trade": 0, "watch": 0, "skip": 0, "errors": 0, "new_trades": []}
 
     for event_id in ids:
