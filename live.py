@@ -11,7 +11,7 @@ import time
 
 from decide import event_decisions
 from filters import Policy
-from paper import PAPER_DDL, process_pending_orders, schedule_order, settle_positions, stats as paper_stats
+from paper import PAPER_DDL, city_day_gate, process_pending_orders, schedule_order, settle_positions, stats as paper_stats
 
 LIVE_DDL = """
 CREATE TABLE IF NOT EXISTS live_decision_runs (
@@ -264,10 +264,33 @@ def run_cycle(
         try:
             state, decisions = event_decisions(db, event_id, evaluation_time, policy)
             counts = Counter(d["action"] for d in decisions)
+            scheduled_trade = None
+            gate_reason = None
             with db:
                 new_trades = persist_snapshot(db, state, decisions, evaluation_time)
-                for decision in new_trades:
-                    schedule_order(db, state, decision, datetime.now(timezone.utc), cfg)
+                no_trades = [
+                    d for d in decisions
+                    if d["action"] == "TRADE" and str(d["side"]).upper() == "NO"
+                ]
+                no_trades.sort(key=lambda d: -(d.get("net_edge") or -999))
+                allowed, gate_reason = city_day_gate(
+                    db,
+                    state["city"],
+                    state["target_date"],
+                    decisions,
+                    cfg,
+                )
+                if allowed and no_trades:
+                    best = no_trades[0]
+                    order_id = schedule_order(
+                        db,
+                        state,
+                        best,
+                        datetime.now(timezone.utc),
+                        cfg,
+                    )
+                    if order_id:
+                        scheduled_trade = best
             summary["events"] += 1
             summary["trade"] += counts.get("TRADE", 0)
             summary["watch"] += counts.get("WATCH", 0)
@@ -281,10 +304,19 @@ def run_cycle(
                 f"WATCH={counts.get('WATCH', 0)} SKIP={counts.get('SKIP', 0)}",
                 flush=True,
             )
-            current_trades = [d for d in decisions if d["action"] == "TRADE"]
+            current_trades = [
+                d for d in decisions
+                if d["action"] == "TRADE" and str(d["side"]).upper() == "NO"
+            ]
             for decision in current_trades:
                 prefix = "NEW TRADE SIGNAL" if decision in new_trades else "TRADE NOW"
                 print(f"{prefix} | {format_trade(decision)}", flush=True)
+            if scheduled_trade:
+                print(
+                    f"PAPER ORDER SCHEDULED | {format_trade(scheduled_trade)} | "
+                    f"gate={gate_reason}",
+                    flush=True,
+                )
         except (ValueError, sqlite3.Error) as exc:
             summary["errors"] += 1
             print(f"{evaluation_time.isoformat()} | {event_id} | ERROR | {exc}", flush=True)
