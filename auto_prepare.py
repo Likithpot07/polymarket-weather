@@ -11,7 +11,7 @@ import sys
 from zoneinfo import ZoneInfo
 
 from collector import DDL
-from probability import calibration, event_markets
+from probability import DEFAULT_SIGMA_FLOOR_C, calibration, event_markets
 
 PREP_DDL = """
 CREATE TABLE IF NOT EXISTS event_preparation (
@@ -90,8 +90,8 @@ def calibration_ready(db: sqlite3.Connection, event_id: str, days: int, now: dat
         if not row:
             return False
         tz = ZoneInfo(str(row[0]))
-        base_sigma = 2.5 if unit == "C" else 4.5
-        fitted = calibration(db, city, station, unit, target, now, tz, days, base_sigma)
+        sigma_floor = DEFAULT_SIGMA_FLOOR_C if unit == "C" else DEFAULT_SIGMA_FLOOR_C * 9 / 5
+        fitted = calibration(db, city, station, unit, target, now, tz, days, sigma_floor)
         return (
             MODELS.issubset(fitted)
             and all(int(fitted[model].get("days", 0)) >= days for model in MODELS)
