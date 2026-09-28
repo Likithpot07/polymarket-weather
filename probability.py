@@ -11,7 +11,9 @@ import re
 import sqlite3
 from zoneinfo import ZoneInfo
 
-VERSION = "baseline-mixture-v2-observed-floor"
+VERSION = "baseline-mixture-v3-hourly-inday-sigma"
+DEFAULT_FALLBACK_SIGMA_C = 2.5
+DEFAULT_SIGMA_FLOOR_C = 1.5
 DDL = """
 CREATE TABLE IF NOT EXISTS probability_runs (
     id INTEGER PRIMARY KEY, event_id TEXT NOT NULL, as_of TEXT NOT NULL,
@@ -147,6 +149,41 @@ def latest_forecasts(db: sqlite3.Connection, city: str, target: str, as_of: date
     return result
 
 
+def in_day_hourly_context(
+    db: sqlite3.Connection,
+    components: list[dict],
+    target: str,
+    unit: str,
+    tz: ZoneInfo,
+    as_of: datetime,
+) -> dict[str, dict]:
+    """Remaining target-day hourly maxima from the same forecast batches used by the model."""
+    target_day = date.fromisoformat(target)
+    result: dict[str, dict] = {}
+    for component in components:
+        target_values: list[tuple[datetime, float]] = []
+        for valid, temp_c in db.execute(
+            """SELECT valid_time,temperature_c
+               FROM forecast_values
+               WHERE batch_id=? AND period='hourly'""",
+            (component["batch_id"],),
+        ):
+            try:
+                moment = parse_time(str(valid))
+                if moment.astimezone(tz).date() != target_day:
+                    continue
+                target_values.append((moment, to_unit(float(temp_c), unit)))
+            except (TypeError, ValueError):
+                continue
+        remaining = [value for moment, value in target_values if moment > as_of]
+        result[str(component["model"])] = {
+            "target_hourly_count": len(target_values),
+            "remaining_hourly_count": len(remaining),
+            "remaining_hourly_max": max(remaining) if remaining else None,
+        }
+    return result
+
+
 def actual_highs(db: sqlite3.Connection, city: str, station: str,
                  tz: ZoneInfo, as_of: datetime) -> dict[str, float]:
     """METAR daily maxima are a calibration proxy, never a settlement result."""
@@ -195,7 +232,7 @@ def actual_highs(db: sqlite3.Connection, city: str, station: str,
 
 def calibration(db: sqlite3.Connection, city: str, station: str | None,
                 unit: str, target: str, as_of: datetime, tz: ZoneInfo,
-                min_days: int, base_sigma: float) -> dict[str, dict]:
+                min_days: int, sigma_floor: float) -> dict[str, dict]:
     if not station:
         return {}
     # Match earlier forecasts to observed, complete days with the same lead in calendar days.
@@ -217,7 +254,7 @@ def calibration(db: sqlite3.Connection, city: str, station: str | None,
             continue
         # Sample estimate, with a floor to prevent false certainty.
         bias = sum(values) / len(values)
-        sigma = max(base_sigma, sqrt(sum((x - bias) ** 2 for x in values) / (len(values) - 1)))
+        sigma = max(sigma_floor, sqrt(sum((x - bias) ** 2 for x in values) / (len(values) - 1)))
         result[model] = {"bias": bias, "sigma": sigma, "days": len(values),
                          "station": station, "source": "METAR proxy", "lead_days": lead}
     return result
@@ -270,9 +307,19 @@ def observed_floor_probability(lo: int | None, hi: int | None, components: list[
     return max(0.0, min(1.0, numerator / denominator))
 
 
-def evaluate(db: sqlite3.Connection, eid: str, as_of: datetime,
-             min_days: int = 14, fallback_sigma_c: float = 2.5,
-             persist: bool = True) -> dict:
+def evaluate(
+    db: sqlite3.Connection,
+    eid: str,
+    as_of: datetime,
+    min_days: int = 14,
+    fallback_sigma_c: float = DEFAULT_FALLBACK_SIGMA_C,
+    sigma_floor_c: float = DEFAULT_SIGMA_FLOOR_C,
+    persist: bool = True,
+) -> dict:
+    if fallback_sigma_c <= 0 or sigma_floor_c <= 0:
+        raise ValueError("sigma settings must be positive")
+    if sigma_floor_c > fallback_sigma_c:
+        raise ValueError("sigma floor cannot exceed fallback sigma")
     bins, city, target, unit, station, verified = event_markets(db, eid)
     loc = db.execute("SELECT timezone FROM locations WHERE city=?", (city,)).fetchone()
     if not loc:
@@ -283,17 +330,44 @@ def evaluate(db: sqlite3.Connection, eid: str, as_of: datetime,
     forecasts = latest_forecasts(db, city, target, as_of)
     if not forecasts:
         raise ValueError(f"Event {eid}: no forecast fetched by {as_of.isoformat()}")
-    base_sigma = fallback_sigma_c if unit == "C" else fallback_sigma_c * 9 / 5
-    trained = calibration(db, city, station, unit, target, as_of, tz, min_days, base_sigma)
+    fallback_sigma = fallback_sigma_c if unit == "C" else fallback_sigma_c * 9 / 5
+    sigma_floor = sigma_floor_c if unit == "C" else sigma_floor_c * 9 / 5
+    trained = calibration(db, city, station, unit, target, as_of, tz, min_days, sigma_floor)
     components = []
     for model, item in sorted(forecasts.items()):
         fit = trained.get(model)
-        components.append({"model": model, "mean": to_unit(item["temperature_c"], unit) +
-                           (fit["bias"] if fit else 0.0),
-                           "sigma": fit["sigma"] if fit else base_sigma,
-                           "calibration_days": fit["days"] if fit else 0,
-                           "fetched_at": item["fetched_at"], "batch_id": item["batch_id"]})
+        bias = fit["bias"] if fit else 0.0
+        daily_mean = to_unit(item["temperature_c"], unit) + bias
+        components.append({
+            "model": model,
+            "mean": daily_mean,
+            "daily_mean": daily_mean,
+            "bias": bias,
+            "sigma": fit["sigma"] if fit else fallback_sigma,
+            "calibration_days": fit["days"] if fit else 0,
+            "fetched_at": item["fetched_at"],
+            "batch_id": item["batch_id"],
+        })
     observed = in_day_observed_high(db, eid, station, target, unit, tz, as_of)
+    hourly_context: dict[str, dict] = {}
+    if observed:
+        hourly_context = in_day_hourly_context(db, components, target, unit, tz, as_of)
+        for component in components:
+            context = hourly_context.get(str(component["model"]), {})
+            remaining_max = context.get("remaining_hourly_max")
+            target_count = int(context.get("target_hourly_count") or 0)
+            if remaining_max is not None:
+                biased_remaining_max = float(remaining_max) + float(component["bias"])
+                component["remaining_hourly_max"] = biased_remaining_max
+                component["mean"] = max(float(observed["high"]), biased_remaining_max)
+                component["in_day_mean_source"] = "observed_high_plus_remaining_hourly"
+            elif target_count > 0:
+                component["remaining_hourly_max"] = None
+                component["mean"] = float(observed["high"])
+                component["in_day_mean_source"] = "observed_high_no_remaining_hours"
+            else:
+                component["remaining_hourly_max"] = None
+                component["in_day_mean_source"] = "daily_max_fallback_no_hourly"
     probs = []
     for mid, label, lo, hi, _ in bins:
         if observed:
@@ -310,33 +384,65 @@ def evaluate(db: sqlite3.Connection, eid: str, as_of: datetime,
     if len(trained) != len(components):
         reasons.append("some models lack enough historical station days; fallback spread used")
     if observed:
-        reasons.append("target-day METAR high used as a lower-bound condition on the forecast mixture")
+        if components and all(c.get("in_day_mean_source") != "daily_max_fallback_no_hourly" for c in components):
+            reasons.append("target-day METAR high combined with remaining hourly forecasts")
+        else:
+            reasons.append("target-day METAR high modeled; some models lack remaining hourly forecasts")
     reasons.append("METAR maximum may differ from official finalized resolution temperature")
     reasons.append("forecast coordinates may differ from resolution station")
     reasons.append("nearest-whole-degree rounding assumed")
-    result = {"event_id": eid, "city": city, "target_date": target, "unit": unit,
-              "station": station, "as_of": as_of.isoformat(), "status": "provisional",
-              "notes": reasons, "components": components,
-              "in_day_observation": observed,
-              "in_day_observations_modeled": bool(observed),
-              "probabilities": probs}
+    result = {
+        "event_id": eid,
+        "city": city,
+        "target_date": target,
+        "unit": unit,
+        "station": station,
+        "as_of": as_of.isoformat(),
+        "status": "provisional",
+        "notes": reasons,
+        "components": components,
+        "in_day_observation": observed,
+        "in_day_hourly_context": hourly_context,
+        "in_day_observations_modeled": bool(observed),
+        "probabilities": probs,
+    }
     if persist:
         with db:
-            cursor = db.execute("""INSERT INTO probability_runs
+            cursor = db.execute(
+                """INSERT INTO probability_runs
                 (event_id,as_of,generated_at,model_version,city,target_date,unit,station,status,diagnostics_json)
                 VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                (eid, as_of.isoformat(), datetime.now(timezone.utc).isoformat(), VERSION,
-                 city, target, unit, station, result["status"], json.dumps({
-                     "notes": reasons, "components": components, "min_calibration_days": min_days,
-                     "fallback_sigma_c": fallback_sigma_c,
-                     "in_day_observation": observed,
-                     "in_day_observations_modeled": bool(observed)})))
+                (
+                    eid,
+                    as_of.isoformat(),
+                    datetime.now(timezone.utc).isoformat(),
+                    VERSION,
+                    city,
+                    target,
+                    unit,
+                    station,
+                    result["status"],
+                    json.dumps({
+                        "notes": reasons,
+                        "components": components,
+                        "min_calibration_days": min_days,
+                        "fallback_sigma_c": fallback_sigma_c,
+                        "sigma_floor_c": sigma_floor_c,
+                        "in_day_observation": observed,
+                        "in_day_hourly_context": hourly_context,
+                        "in_day_observations_modeled": bool(observed),
+                    }),
+                ),
+            )
             result["run_id"] = cursor.lastrowid
-            db.executemany("INSERT INTO bracket_probabilities VALUES (?,?,?,?,?)",
-                           [(cursor.lastrowid, p["market_id"], p["bracket"], p["p_yes"], p["p_no"])
-                            for p in probs])
+            db.executemany(
+                "INSERT INTO bracket_probabilities VALUES (?,?,?,?,?)",
+                [
+                    (cursor.lastrowid, p["market_id"], p["bracket"], p["p_yes"], p["p_no"])
+                    for p in probs
+                ],
+            )
     return result
-
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
@@ -344,10 +450,12 @@ def main() -> None:
     ap.add_argument("--event-id", required=True, help="Gamma event ID, not an individual bracket market ID")
     ap.add_argument("--as-of", default=datetime.now(timezone.utc).isoformat())
     ap.add_argument("--min-calibration-days", type=int, default=14)
-    ap.add_argument("--fallback-sigma-c", type=float, default=2.5)
+    ap.add_argument("--fallback-sigma-c", type=float, default=DEFAULT_FALLBACK_SIGMA_C)
+    ap.add_argument("--sigma-floor-c", type=float, default=DEFAULT_SIGMA_FLOOR_C)
     args = ap.parse_args()
-    if args.min_calibration_days < 2 or args.fallback_sigma_c <= 0:
-        ap.error("min-calibration-days must be >= 2 and fallback-sigma-c > 0")
+    if (args.min_calibration_days < 2 or args.fallback_sigma_c <= 0
+            or args.sigma_floor_c <= 0 or args.sigma_floor_c > args.fallback_sigma_c):
+        ap.error("min-calibration-days must be >= 2 and 0 < sigma-floor-c <= fallback-sigma-c")
     config_file = Path(args.config).resolve()
     cfg = json.loads(config_file.read_text(encoding="utf-8"))
     db_path = Path(cfg["db_path"])
@@ -357,8 +465,14 @@ def main() -> None:
     db = sqlite3.connect(db_path)
     try:
         db.executescript(DDL)
-        result = evaluate(db, args.event_id, parse_time(args.as_of),
-                          args.min_calibration_days, args.fallback_sigma_c)
+        result = evaluate(
+            db,
+            args.event_id,
+            parse_time(args.as_of),
+            args.min_calibration_days,
+            args.fallback_sigma_c,
+            args.sigma_floor_c,
+        )
         print(json.dumps(result, indent=2))
     except (ValueError, sqlite3.Error) as exc:
         ap.error(str(exc))
