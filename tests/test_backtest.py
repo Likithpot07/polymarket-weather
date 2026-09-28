@@ -113,6 +113,12 @@ class BacktestTest(unittest.TestCase):
                 VALUES (?, 'NYC', ?, ?, NULL, '', '{}')""",
                        (i + 1, model, f"2026-09-24T18:00:0{i}+00:00"))
             db.execute("INSERT INTO forecast_values VALUES (?, 'daily_max', '2026-09-25', 21)", (i + 1,))
+        for i, model in enumerate(("ecmwf", "gfs", "icon"), 4):
+            db.execute("""INSERT INTO forecast_batches
+                (id,city,model,fetched_at,model_run_at,endpoint,raw_json)
+                VALUES (?, 'NYC', ?, ?, NULL, '', '{}')""",
+                       (i, model, f"2026-09-25T12:00:0{i - 4}+00:00"))
+            db.execute("INSERT INTO forecast_values VALUES (?, 'daily_max', '2026-09-25', 21)", (i,))
         for token in ("lo-y", "lo-n", "hi-y", "hi-n"):
             book = '{"bids":[{"price":"0.3","size":"10"}],"asks":[{"price":"0.4","size":"10"}]}'
             db.execute("""INSERT INTO book_events(token_id,event_type,received_at,raw_json)
@@ -123,8 +129,9 @@ class BacktestTest(unittest.TestCase):
         validate_event_labels(db, "event1", "2026-09-25", labels)
         rows, skips = build(db, ["event1"], {"weather_models": ["ecmwf", "gfs", "icon"]},
                             Policy(), labels)
-        self.assertEqual(len(rows), 4)
+        self.assertEqual(len(rows), 8)
         self.assertEqual(rows[0]["as_of"], "2026-09-24T18:00:02+00:00")
+        self.assertEqual(sum(not r["pre_target_day"] for r in rows), 4)
         self.assertEqual({r["won"] for r in rows}, {0, 1})
         self.assertTrue(all(r["rules_verified"] for r in rows))
         self.assertFalse(skips)
