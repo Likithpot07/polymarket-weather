@@ -15,7 +15,7 @@ REQUIRED_RULE_PATTERNS = {
     "highest_temp": r"highest\s+temperature\s+recorded\s+by\s+NOAA",
     "temp_column": r'highest\s+reading\s+under\s+the\s+["“”]?Temp["“”]?\s+column',
     "hourly_data": r"Hourly\s+Data",
-    "whole_degrees": r"whole\s+degrees?\s+Fahrenheit",
+    "whole_degrees": r"whole\s+degrees?\s+(?:Fahrenheit|Celsius)",
     "fallback": r"Weather\s+Underground\s+Daily\s+Observations",
     "next_day_cutoff": r"first\s+data\s*point\s+for\s+the\s+following\s+date|first\s+datapoint\s+for\s+the\s+following\s+date",
 }
@@ -47,8 +47,8 @@ def verify_event_payload(event: dict) -> dict:
             raise ValueError("market missing id")
         if metadata["station"] is None:
             raise ValueError(f"market {market_id}: station not found in resolution source")
-        if metadata["unit"] != "F":
-            raise ValueError(f"market {market_id}: expected Fahrenheit rules")
+        if metadata["unit"] not in ("C", "F"):
+            raise ValueError(f"market {market_id}: Celsius/Fahrenheit unit not confirmed")
         if metadata["rounding"] != "whole degree":
             raise ValueError(f"market {market_id}: whole-degree precision not confirmed")
         source = str(metadata["source_url"] or "")
@@ -82,8 +82,8 @@ def verify_event_payload(event: dict) -> dict:
         raise ValueError("markets do not share one identical resolution rule set")
 
     units = {row[3] for row in parsed_brackets}
-    if units != {"F"}:
-        raise ValueError("market brackets are not uniformly Fahrenheit")
+    if len(units) != 1 or next(iter(units)) != normalized[0]["unit"]:
+        raise ValueError("market bracket units do not match the resolution rules")
 
     bins = sorted(parsed_brackets, key=lambda row: float("-inf") if row[1] is None else row[1])
     if bins[0][1] is not None or bins[-1][2] is not None:
@@ -131,8 +131,9 @@ def main() -> None:
         parser.error(str(exc))
 
     reviewed_at = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(db_path) as db:
+    with sqlite3.connect(db_path, timeout=30) as db:
         db.execute("PRAGMA foreign_keys=ON")
+        db.execute("PRAGMA busy_timeout=30000")
         db.executescript(DDL)
         with db:
             save_event(db, event)
@@ -159,9 +160,9 @@ def main() -> None:
                     verified["rounding"],
                     verified["time_window"],
                     reviewed_at,
-                    "Strictly verified against live Polymarket rules: NOAA primary source, "
-                    "station/source match, Hourly Data Temp column, whole-degree Fahrenheit, "
-                    "Weather Underground fallback, next-day publication cutoff, contiguous brackets.",
+                    f"Strictly verified against live Polymarket rules: NOAA primary source, "
+                    f"station/source match, Hourly Data Temp column, whole-degree {verified['unit']}, "
+                    f"Weather Underground fallback, next-day publication cutoff, contiguous brackets.",
                     args.event_id,
                 ),
             )
