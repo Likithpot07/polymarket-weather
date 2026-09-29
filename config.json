@@ -30,12 +30,14 @@
     "max_slippage_per_share": 0.03,
     "max_book_age_seconds": 10,
     "settlement_check_seconds": 300,
-    "max_trades_per_city_day": 3,
+    "max_trades_per_city_day": 1,
     "deterioration_probability_drop": 0.15
   },
   "decision": {
     "allowed_sides": [
       "NO"
-    ]
+    ],
+    "min_no_probability": 0.7,
+    "max_model_market_gap": 0.4
   }
 }
