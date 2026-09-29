@@ -25,6 +25,8 @@ class Policy:
     watch_on_target_day: bool = True
     weather_fee_rate: float = 0.05
     slippage_per_share: float = 0.01
+    min_no_probability: float = 0.0
+    max_model_market_gap: float = 1.0
 
     @classmethod
     def from_config(cls, cfg: dict) -> "Policy":
@@ -39,7 +41,8 @@ class Policy:
             raise ValueError("allowed_sides must contain YES and/or NO")
         for key in ("min_net_edge", "max_spread", "min_ask_depth", "max_book_age_seconds",
                     "max_forecast_age_hours", "max_model_spread_c", "min_calibration_days",
-                    "weather_fee_rate", "slippage_per_share"):
+                    "weather_fee_rate", "slippage_per_share", "min_no_probability",
+                    "max_model_market_gap"):
             value = getattr(policy, key)
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{key} must be a nonnegative finite number")
@@ -87,6 +90,13 @@ def assess(state: dict, outcome: dict, side: str, quote: dict | None,
                 hard.append("NO_POSITIVE_NET_EDGE")
             elif result["net_edge"] < policy.min_net_edge:
                 soft.append("BELOW_MIN_NET_EDGE")
+            if side == "NO":
+                if result["model_probability"] < policy.min_no_probability:
+                    soft.append("NO_PROBABILITY_TOO_LOW")
+                model_market_gap = result["model_probability"] - float(quote["best_ask"])
+                result["model_market_gap"] = model_market_gap
+                if model_market_gap > policy.max_model_market_gap:
+                    soft.append("EXTREME_MODEL_MARKET_DIVERGENCE")
         except ValueError:
             hard.append("INVALID_PRICE")
     components = state.get("components", [])
