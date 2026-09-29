@@ -26,6 +26,14 @@ CREATE TABLE IF NOT EXISTS live_decision_runs (
 CREATE INDEX IF NOT EXISTS live_run_event_time
 ON live_decision_runs(event_id,as_of);
 
+CREATE TABLE IF NOT EXISTS live_model_diagnostics (
+    run_id INTEGER PRIMARY KEY REFERENCES live_decision_runs(id),
+    event_id TEXT NOT NULL,
+    as_of TEXT NOT NULL,
+    model_version TEXT,
+    diagnostics_json TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS live_decisions (
     run_id INTEGER NOT NULL REFERENCES live_decision_runs(id),
     market_id TEXT NOT NULL,
@@ -146,6 +154,28 @@ def persist_snapshot(
         ),
     )
     run_id = cursor.lastrowid
+    db.execute(
+        """INSERT INTO live_model_diagnostics(
+               run_id,event_id,as_of,model_version,diagnostics_json
+           ) VALUES (?,?,?,?,?)""",
+        (
+            run_id,
+            state["event_id"],
+            as_of.isoformat(),
+            state.get("model_version"),
+            json.dumps(
+                {
+                    "status": state.get("status"),
+                    "notes": state.get("notes", []),
+                    "components": state.get("components", []),
+                    "in_day_observation": state.get("in_day_observation"),
+                    "in_day_hourly_context": state.get("in_day_hourly_context", {}),
+                    "in_day_observations_modeled": state.get("in_day_observations_modeled"),
+                },
+                separators=(",", ":"),
+            ),
+        ),
+    )
     new_trades: list[dict] = []
 
     for decision in decisions:
