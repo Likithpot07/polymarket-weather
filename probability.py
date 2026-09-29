@@ -392,6 +392,7 @@ def evaluate(
     reasons.append("forecast coordinates may differ from resolution station")
     reasons.append("nearest-whole-degree rounding assumed")
     result = {
+        "model_version": VERSION,
         "event_id": eid,
         "city": city,
         "target_date": target,
