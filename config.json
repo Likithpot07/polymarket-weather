@@ -28,7 +28,7 @@
     "notional_usd": 10,
     "latency_ms": 1000,
     "max_slippage_per_share": 0.03,
-    "max_book_age_seconds": 10,
+    "max_book_age_seconds": 30,
     "settlement_check_seconds": 300,
     "max_trades_per_city_day": 1,
     "deterioration_probability_drop": 0.15
@@ -39,5 +39,18 @@
     ],
     "min_no_probability": 0.7,
     "max_model_market_gap": 0.4
-  }
+  },
+  "dataset_cities": [
+    "Atlanta",
+    "Austin",
+    "Chicago",
+    "Dallas",
+    "Denver",
+    "Houston",
+    "Los Angeles",
+    "Miami",
+    "NYC",
+    "San Francisco",
+    "Seattle"
+  ]
 }

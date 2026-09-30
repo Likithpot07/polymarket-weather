@@ -93,6 +93,10 @@ def _finite_float(value) -> float | None:
 
 
 def best_no_trade(decisions: list[dict]) -> dict | None:
+    """Among eligible NO trades in this city-day, pick the one the MARKET
+    is most confident is excluded (lowest ask) — not the one our model
+    disagrees with the market on the most. A big model-vs-market gap is
+    usually our model being wrong, not a real edge."""
     candidates = [
         decision for decision in decisions
         if decision.get("action") == "TRADE"
@@ -100,12 +104,12 @@ def best_no_trade(decisions: list[dict]) -> dict | None:
     ]
     if not candidates:
         return None
-    return max(
+    return min(
         candidates,
         key=lambda decision: (
-            _finite_float(decision.get("net_edge"))
-            if _finite_float(decision.get("net_edge")) is not None
-            else float("-inf")
+            _finite_float(decision.get("best_ask"))
+            if _finite_float(decision.get("best_ask")) is not None
+            else float("inf")
         ),
     )
 
