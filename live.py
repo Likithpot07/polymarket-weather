@@ -11,7 +11,7 @@ import time
 
 from decide import event_decisions
 from filters import Policy
-from paper import PAPER_DDL, best_no_trade, city_day_gate, process_pending_orders, schedule_order, settle_positions, stats as paper_stats
+from paper import PAPER_DDL, best_no_trade, city_day_gate, locked_candidates, process_pending_orders, schedule_order, settle_positions, stats as paper_stats
 
 LIVE_DDL = """
 CREATE TABLE IF NOT EXISTS live_decision_runs (
@@ -171,6 +171,7 @@ def persist_snapshot(
                     "in_day_observation": state.get("in_day_observation"),
                     "in_day_hourly_context": state.get("in_day_hourly_context", {}),
                     "in_day_observations_modeled": state.get("in_day_observations_modeled"),
+                    "combined": state.get("combined"),
                 },
                 separators=(",", ":"),
             ),
@@ -345,6 +346,14 @@ def format_trade(decision: dict) -> str:
     depth_text = "NA" if depth is None else f"{depth:.2f}"
     edge_text = "NA" if edge is None else f"{edge * 100:.2f}%"
     probability_text = "NA" if probability is None else f"{probability * 100:.2f}%"
+    blended = decision.get("blended_probability")
+    market = decision.get("market_probability")
+    if blended is not None:
+        probability_text += f" blend={blended * 100:.1f}%"
+    if market is not None:
+        probability_text += f" mkt={market * 100:.1f}%"
+    if decision.get("locked_no"):
+        probability_text += " LOCKED"
     return (
         f"{decision['side']} | p={probability_text} | ask={ask_text} | "
         f"depth={depth_text} | net_edge={edge_text} | {decision.get('bracket')}"
@@ -371,14 +380,20 @@ def run_cycle(
             gate_reason = None
             with db:
                 new_trades = persist_snapshot(db, state, decisions, evaluation_time)
-                best = best_no_trade(decisions)
-                allowed, gate_reason = city_day_gate(
-                    db,
-                    state["city"],
-                    state["target_date"],
-                    decisions,
-                    cfg,
-                )
+                locked = locked_candidates(db, state["event_id"], decisions)
+                if locked:
+                    # Locked brackets can't win; each is its own trade, so skip the city-day limit.
+                    best = best_no_trade(locked)
+                    allowed, gate_reason = True, "LOCKED_NO"
+                else:
+                    best = best_no_trade(decisions)
+                    allowed, gate_reason = city_day_gate(
+                        db,
+                        state["city"],
+                        state["target_date"],
+                        decisions,
+                        cfg,
+                    )
                 if allowed and best:
                     order_id = schedule_order(
                         db,

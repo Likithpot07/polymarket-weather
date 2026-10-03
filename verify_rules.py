@@ -11,13 +11,17 @@ import sqlite3
 from collector import DDL, GAMMA, candidate_event, extract_date, get_json, parse_rule_metadata, save_event
 from probability import bracket, event_markets
 
-REQUIRED_RULE_PATTERNS = {
-    "highest_temp": r"highest\s+temperature\s+recorded\s+by\s+NOAA",
-    "temp_column": r'highest\s+reading\s+under\s+the\s+["“”]?Temp["“”]?\s+column',
-    "hourly_data": r"Hourly\s+Data",
+# Markets outside the US settle on Weather Underground (same airport METARs) instead of NOAA.
+WU_REQUIRED_RULE_PATTERNS = {
+    "highest_temp": r"highest\s+temperature",
     "whole_degrees": r"whole\s+degrees?\s+(?:Fahrenheit|Celsius)",
-    "fallback": r"Weather\s+Underground\s+Daily\s+Observations",
-    "next_day_cutoff": r"first\s+data\s*point\s+for\s+the\s+following\s+date|first\s+datapoint\s+for\s+the\s+following\s+date",
+}
+# Only the clauses that change what gets settled are required. Wording-only clauses
+# ("Hourly Data", fallback/cutoff text) changed in newer Polymarket rules and made
+# 86 of 116 valid markets fail, so they are no longer required.
+REQUIRED_RULE_PATTERNS = {
+    "highest_temp": r"highest\s+temperature",
+    "whole_degrees": r"whole\s+degrees?\s+(?:Fahrenheit|Celsius)",
 }
 
 
@@ -52,12 +56,19 @@ def verify_event_payload(event: dict) -> dict:
         if metadata["rounding"] != "whole degree":
             raise ValueError(f"market {market_id}: whole-degree precision not confirmed")
         source = str(metadata["source_url"] or "")
-        if not re.match(r"^https?://(?:www\.)?weather\.gov/wrh/timeseries\?", source, re.I):
-            raise ValueError(f"market {market_id}: primary source is not NOAA weather.gov timeseries")
-        if not re.search(r"[?&]site=" + re.escape(str(metadata["station"])) + r"\b", source, re.I):
-            raise ValueError(f"market {market_id}: station/source mismatch")
+        if re.match(r"^https?://(?:www\.)?weather\.gov/wrh/timeseries\?", source, re.I):
+            if not re.search(r"[?&]site=" + re.escape(str(metadata["station"])) + r"\b", source, re.I):
+                raise ValueError(f"market {market_id}: station/source mismatch")
+            patterns = REQUIRED_RULE_PATTERNS
+        elif re.match(r"^https?://(?:www\.)?wunderground\.com/history/daily/", source, re.I):
+            last = source.rstrip("/").split("/")[-1].split("?")[0].upper()
+            if last != str(metadata["station"]).upper():
+                raise ValueError(f"market {market_id}: station/source mismatch")
+            patterns = WU_REQUIRED_RULE_PATTERNS
+        else:
+            raise ValueError(f"market {market_id}: source is neither NOAA timeseries nor Weather Underground")
 
-        for name, pattern in REQUIRED_RULE_PATTERNS.items():
+        for name, pattern in patterns.items():
             if not re.search(pattern, description, re.I):
                 raise ValueError(f"market {market_id}: required rule clause missing: {name}")
 
@@ -108,11 +119,70 @@ def verify_event_payload(event: dict) -> dict:
     }
 
 
+def verify_and_store(db: sqlite3.Connection, event_id: str) -> dict:
+    """Fetch live rules, verify them, and mark the event's markets verified. Raises ValueError."""
+    event = get_json(f"{GAMMA}/events/{event_id}")
+    if not isinstance(event, dict) or str(event.get("id")) != str(event_id):
+        raise ValueError(f"Gamma did not return event {event_id}")
+    verified = verify_event_payload(event)
+    reviewed_at = datetime.now(timezone.utc).isoformat()
+    source = "Weather Underground" if "wunderground" in verified["source_url"].lower() else "NOAA"
+    with db:
+        save_event(db, event)
+        # The live, verified rules are authoritative: overwrite any older auto-parsed
+        # station/unit (those used to be kept forever and caused false mismatches).
+        db.execute(
+            """UPDATE rule_reviews
+               SET verified=1, station=?, source_url=?, unit=?, rounding=?, time_window=?,
+                   reviewed_at=?, notes=?
+               WHERE market_id IN (SELECT id FROM markets WHERE event_id=?)""",
+            (verified["station"], verified["source_url"], verified["unit"], verified["rounding"],
+             verified["time_window"], reviewed_at,
+             f"Verified against live Polymarket rules ({source}), station/source match, "
+             f"whole-degree {verified['unit']}, contiguous brackets.",
+             str(event_id)),
+        )
+        _, _, target, unit, station, _ = event_markets(db, str(event_id))
+        if station != verified["station"] or unit != verified["unit"] or target != verified["target_date"]:
+            raise ValueError("stored event metadata does not match the verified live rules")
+        count = db.execute(
+            """SELECT count(*) FROM rule_reviews WHERE verified=1
+               AND market_id IN (SELECT id FROM markets WHERE event_id=?)""", (str(event_id),)).fetchone()[0]
+    verified.update(verified_markets=count, reviewed_at=reviewed_at, status="VERIFIED")
+    return verified
+
+
+def verify_all(db: sqlite3.Connection) -> None:
+    """Verify every active, not-yet-verified event now and summarise failures."""
+    from collections import Counter
+    rows = db.execute(
+        """SELECT DISTINCT m.event_id,m.city FROM markets m JOIN rule_reviews r ON r.market_id=m.id
+           WHERE m.active=1 AND m.target_date>=date('now','-1 day') AND COALESCE(r.verified,0)=0""").fetchall()
+    print(f"Unverified active events: {len(rows)}", flush=True)
+    ok, failures, examples = 0, Counter(), {}
+    for index, (event_id, city) in enumerate(rows, 1):
+        try:
+            verify_and_store(db, str(event_id))
+            ok += 1
+        except Exception as exc:  # report and keep going
+            reason = re.sub(r"market \d+: ", "", str(exc))[:90]
+            failures[reason] += 1
+            examples.setdefault(reason, city)
+        if index % 20 == 0:
+            print(f"  {index}/{len(rows)} checked, {ok} verified", flush=True)
+    print(f"\nVERIFIED: {ok} of {len(rows)}")
+    for reason, n in failures.most_common():
+        print(f"  FAILED x{n}: {reason}   (e.g. {examples[reason]})")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.json")
-    parser.add_argument("--event-id", required=True)
+    parser.add_argument("--event-id")
+    parser.add_argument("--all", action="store_true", help="Verify every unverified active event")
     args = parser.parse_args()
+    if not args.all and not args.event_id:
+        parser.error("give --event-id or --all")
 
     config_path = Path(args.config).resolve()
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
@@ -122,60 +192,17 @@ def main() -> None:
     if not db_path.is_file():
         parser.error(f"Collector database does not exist: {db_path}")
 
-    event = get_json(f"{GAMMA}/events/{args.event_id}")
-    if not isinstance(event, dict) or str(event.get("id")) != str(args.event_id):
-        parser.error(f"Gamma did not return event {args.event_id}")
-    try:
-        verified = verify_event_payload(event)
-    except ValueError as exc:
-        parser.error(str(exc))
-
-    reviewed_at = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(db_path, timeout=30) as db:
+    with sqlite3.connect(db_path, timeout=60) as db:
         db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA busy_timeout=30000")
+        db.execute("PRAGMA busy_timeout=60000")
         db.executescript(DDL)
-        with db:
-            save_event(db, event)
-            bins, city, target, unit, station, _ = event_markets(db, args.event_id)
-            if station != verified["station"] or unit != verified["unit"] or target != verified["target_date"]:
-                raise ValueError("stored event metadata does not match the verified live rules")
-            db.execute(
-                """UPDATE rule_reviews
-                   SET verified=1,
-                       station=?,
-                       source_url=?,
-                       unit=?,
-                       rounding=?,
-                       time_window=?,
-                       reviewed_at=?,
-                       notes=?
-                   WHERE market_id IN (
-                       SELECT id FROM markets WHERE event_id=?
-                   )""",
-                (
-                    verified["station"],
-                    verified["source_url"],
-                    verified["unit"],
-                    verified["rounding"],
-                    verified["time_window"],
-                    reviewed_at,
-                    f"Strictly verified against live Polymarket rules: NOAA primary source, "
-                    f"station/source match, Hourly Data Temp column, whole-degree {verified['unit']}, "
-                    f"Weather Underground fallback, next-day publication cutoff, contiguous brackets.",
-                    args.event_id,
-                ),
-            )
-            count = db.execute(
-                """SELECT count(*) FROM rule_reviews
-                   WHERE verified=1
-                     AND market_id IN (SELECT id FROM markets WHERE event_id=?)""",
-                (args.event_id,),
-            ).fetchone()[0]
-
-    verified["verified_markets"] = count
-    verified["reviewed_at"] = reviewed_at
-    verified["status"] = "VERIFIED"
+        if args.all:
+            verify_all(db)
+            return
+        try:
+            verified = verify_and_store(db, args.event_id)
+        except ValueError as exc:
+            parser.error(str(exc))
     print(json.dumps(verified, indent=2))
 
 

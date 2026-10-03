@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import truststore
 
-from collector import DDL
+from collector import DDL, station_coordinates
 from probability import DEFAULT_SIGMA_FLOOR_C, calibration, event_markets, parse_time
 
 truststore.inject_into_ssl()
@@ -301,6 +301,11 @@ def main() -> None:
         if not location:
             parser.error(f"No saved location/timezone for {city}")
         latitude, longitude, timezone_name = float(location[0]), float(location[1]), str(location[2])
+        # Keep calibration forecasts at the same point the live collector uses.
+        if cfg.get("forecast_at_station", True):
+            station_point = station_coordinates(db, city)
+            if station_point:
+                latitude, longitude = station_point[0], station_point[1]
         tz = ZoneInfo(timezone_name)
         target_day = date.fromisoformat(target)
         current_local = as_of.astimezone(tz)

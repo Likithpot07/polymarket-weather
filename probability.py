@@ -11,9 +11,17 @@ import re
 import sqlite3
 from zoneinfo import ZoneInfo
 
-VERSION = "baseline-mixture-v3-hourly-inday-sigma"
+VERSION = "mixture-v4-inday-max-remaining"
 DEFAULT_FALLBACK_SIGMA_C = 2.5
 DEFAULT_SIGMA_FLOOR_C = 1.5
+# In-day: uncertainty of the *remaining* maximum shrinks as the heating window closes.
+PEAK_WINDOW_START_HOUR = 6    # local hour when daytime heating starts
+PEAK_WINDOW_END_HOUR = 17     # local hour after which a new daily high is rare
+MIN_REMAINING_SIGMA_C = 0.45  # ~0.8F residual uncertainty even after the peak
+# A bracket is "locked NO" once the observed high clears its top edge by this
+# margin (covers METAR-vs-Weather-Underground rounding/revision noise).
+LOCK_MARGIN_C = 0.6           # ~1.1F
+LOCK_PLAUSIBLE_C = 4.0        # locks need the observed high within this of a forecast
 DDL = """
 CREATE TABLE IF NOT EXISTS probability_runs (
     id INTEGER PRIMARY KEY, event_id TEXT NOT NULL, as_of TEXT NOT NULL,
@@ -76,10 +84,12 @@ def event_markets(db: sqlite3.Connection, eid: str):
         if b is None:
             raise ValueError(f"Event {eid}: cannot parse bracket for market {mid}: {question}")
         parsed.append((mid, question, *b))
+    # The bracket text ("36°C") is what gets settled. Rule text sometimes mentions
+    # both scales, so a rule unit that disagrees is ignored; observations carry
+    # their own stored unit and are converted, so nothing is compared across scales.
     units = {r[4] for r in parsed}
-    units.update(r[5] for r in rows if r[5] in ("C", "F"))
     if len(units) != 1:
-        raise ValueError(f"Event {eid}: conflicting bracket/rule units")
+        raise ValueError(f"Event {eid}: brackets use more than one unit")
     bins = sorted(parsed, key=lambda r: float("-inf") if r[2] is None else r[2])
     if len(bins) < 2 or bins[0][2] is not None or bins[-1][3] is not None:
         raise ValueError(f"Event {eid}: missing lower or upper tail")
@@ -129,6 +139,8 @@ def in_day_observed_high(db: sqlite3.Connection, eid: str, station: str | None,
     return {
         "station": station,
         "high": max(value for _, value in values),
+        # Second-highest reading: a lock needs two readings, so one bad METAR can't create it.
+        "confirmed_high": sorted((value for _, value in values), reverse=True)[1] if len(values) > 1 else None,
         "unit": unit,
         "latest_observed_at": latest.isoformat(),
         "reading_count": len(values),
@@ -237,6 +249,9 @@ def calibration(db: sqlite3.Connection, city: str, station: str | None,
         return {}
     # Match earlier forecasts to observed, complete days with the same lead in calendar days.
     lead = max(0, (date.fromisoformat(target) - as_of.astimezone(tz).date()).days)
+    history_fit = station_history_fit(db, city, unit, lead, as_of, tz, sigma_floor)
+    if len(history_fit) >= 3:
+        return history_fit  # long station history beats the short per-event backfill
     highs = actual_highs(db, city, station, tz, as_of)
     residuals: dict[str, list[float]] = defaultdict(list)
     for day, actual_c in highs.items():
@@ -248,9 +263,9 @@ def calibration(db: sqlite3.Connection, city: str, station: str | None,
         old = latest_forecasts(db, city, day, cutoff)
         for model, item in old.items():
             residuals[model].append(to_unit(actual_c, unit) - to_unit(item["temperature_c"], unit))
-    result = {}
+    result = dict(history_fit)
     for model, values in residuals.items():
-        if len(values) < min_days:
+        if model in result or len(values) < min_days:
             continue
         # Sample estimate, with a floor to prevent false certainty.
         bias = sum(values) / len(values)
@@ -258,6 +273,86 @@ def calibration(db: sqlite3.Connection, city: str, station: str | None,
         result[model] = {"bias": bias, "sigma": sigma, "days": len(values),
                          "station": station, "source": "METAR proxy", "lead_days": lead}
     return result
+
+
+STATION_WINDOW_DAYS = 45  # backtest_early.py: 45 days beat 90
+STATION_MIN_DAYS = 30
+COMBINED_SIGMA_FLOOR_C = 0.5  # same floor backtest_early.py validated (the 1.5C default was hiding real accuracy)
+
+
+def station_history_fit(db: sqlite3.Connection, city: str, unit: str, lead: int,
+                        as_of: datetime, tz: ZoneInfo, sigma_floor: float) -> dict[str, dict]:
+    """Bias/spread per model from station_history.py, using only days finished before as_of."""
+    last_complete = (as_of.astimezone(tz).date() - timedelta(days=1)).isoformat()
+    lead = min(max(lead, 0), 3)
+    try:
+        rows = db.execute(
+            """SELECT model,residual_c FROM (
+                   SELECT model,residual_c,day,
+                          ROW_NUMBER() OVER (PARTITION BY model ORDER BY day DESC) AS rn
+                   FROM station_residuals
+                   WHERE city=? AND lead_days=? AND day<=?)
+               WHERE rn<=?""",
+            (city, lead, last_complete, STATION_WINDOW_DAYS),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+    scale = 1.0 if unit == "C" else 9 / 5  # a temperature *difference*: no +32
+    residuals: dict[str, list[float]] = defaultdict(list)
+    for model, residual_c in rows:
+        residuals[str(model)].append(float(residual_c) * scale)
+    result = {}
+    for model, values in residuals.items():
+        if len(values) < STATION_MIN_DAYS:
+            continue
+        bias = sum(values) / len(values)
+        sigma = max(sigma_floor, sqrt(sum((x - bias) ** 2 for x in values) / (len(values) - 1)))
+        result[model] = {"bias": bias, "sigma": sigma, "days": len(values),
+                         "source": "station_history", "lead_days": lead}
+    return result
+
+
+def combined_fit(db: sqlite3.Connection, city: str, unit: str, lead: int,
+                 as_of: datetime, tz: ZoneInfo, models: list[str],
+                 sigma_floor: float) -> dict | None:
+    """One bell curve around the weighted, bias-corrected average of the models.
+
+    backtest_early.py Part A: beats mixing the models (26% vs 22% on the right
+    1C bracket one day ahead). Fitted only on days finished before as_of.
+    """
+    last_complete = (as_of.astimezone(tz).date() - timedelta(days=1)).isoformat()
+    first = (as_of.astimezone(tz).date() - timedelta(days=STATION_WINDOW_DAYS)).isoformat()
+    lead = min(max(lead, 0), 3)
+    try:
+        rows = db.execute(
+            """SELECT day,model,forecast_c,actual_c FROM station_residuals
+               WHERE city=? AND lead_days=? AND day>=? AND day<=?""",
+            (city, lead, first, last_complete),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    per_day: dict[str, dict[str, tuple[float, float]]] = defaultdict(dict)
+    for day, model, forecast_c, actual_c in rows:
+        per_day[day][str(model)] = (float(forecast_c), float(actual_c))
+    days = [v for v in per_day.values() if all(m in v for m in models)]
+    if len(days) < STATION_MIN_DAYS:
+        return None
+    fits = {}
+    for m in models:
+        res = [v[m][1] - v[m][0] for v in days]
+        bias = sum(res) / len(res)
+        sd = sqrt(sum((r - bias) ** 2 for r in res) / (len(res) - 1))
+        fits[m] = (bias, max(0.3, sd))
+    raw = {m: 1 / s ** 2 for m, (_, s) in fits.items()}
+    total = sum(raw.values())
+    weights = {m: r / total for m, r in raw.items()}
+    res = [v[models[0]][1] - sum(weights[m] * (v[m][0] + fits[m][0]) for m in models) for v in days]
+    bias = sum(res) / len(res)
+    sd_c = sqrt(sum((r - bias) ** 2 for r in res) / (len(res) - 1))
+    scale = 1.0 if unit == "C" else 9 / 5
+    return {"weights": weights, "model_bias": {m: fits[m][0] * scale for m in models},
+            "bias": bias * scale, "sigma": max(sigma_floor, sd_c * scale), "days": len(days),
+            "lead_days": lead}
 
 
 def cdf(x: float, mean: float, sigma: float) -> float:
@@ -290,21 +385,51 @@ def probability(lo: int | None, hi: int | None, mean: float, sigma: float) -> fl
 
 def observed_floor_probability(lo: int | None, hi: int | None, components: list[dict],
                                observed_high: float) -> float:
-    """Condition the mixture on the final daily maximum being at least the observed high."""
-    numerator = 0.0
-    denominator = 0.0
+    """P(final high in bracket) where final = max(observed_high, remaining_max).
+
+    Each component carries ``remaining_mean``/``remaining_sigma`` describing the
+    maximum still to come today. The final high can never be below what was
+    already observed, and it only rises above it if the remaining maximum does.
+    (v3 instead truncated a full-day normal centred on the observed high, which
+    pushed ~all probability *above* the current high even after the peak.)
+    """
     lower = None if lo is None else lo - 0.5
     upper = None if hi is None else hi + 0.5
-    for component in components:
-        mean = float(component["mean"])
-        sigma = float(component["sigma"])
-        survival_mass = survival(observed_high, mean, sigma)
-        denominator += survival_mass
-        effective_lower = observed_high if lower is None else max(lower, observed_high)
-        numerator += interval_probability(effective_lower, upper, mean, sigma)
-    if denominator <= 0:
-        raise ValueError("Observed high is outside the numerical support of every weather model")
-    return max(0.0, min(1.0, numerator / denominator))
+
+    def final_cdf(x: float | None, component: dict) -> float:
+        if x is None:
+            return 1.0
+        if x < observed_high:
+            return 0.0
+        mean = float(component.get("remaining_mean", component["mean"]))
+        sigma = float(component.get("remaining_sigma", component["sigma"]))
+        return cdf(x, mean, sigma)
+
+    if not components:
+        raise ValueError("No weather components")
+    total = 0.0
+    for component, weight in zip(components, component_weights(components)):
+        upper_cdf = final_cdf(upper, component)
+        lower_cdf = 0.0 if lower is None else final_cdf(lower, component)
+        total += weight * max(0.0, upper_cdf - lower_cdf)
+    return max(0.0, min(1.0, total))
+
+
+def component_weights(components: list[dict]) -> list[float]:
+    """Trust sharper (historically more accurate) models more: weight ~ 1/sigma^2."""
+    raw = [1.0 / float(c["sigma"]) ** 2 for c in components]
+    total = sum(raw)
+    return [r / total for r in raw]
+
+
+def remaining_sigma(full_sigma: float, as_of: datetime, tz: ZoneInfo, unit: str) -> float:
+    """Shrink forecast spread with the fraction of the heating window left."""
+    local = as_of.astimezone(tz)
+    hour = local.hour + local.minute / 60
+    window = PEAK_WINDOW_END_HOUR - PEAK_WINDOW_START_HOUR
+    left = min(window, max(0.0, PEAK_WINDOW_END_HOUR - max(hour, PEAK_WINDOW_START_HOUR)))
+    floor = MIN_REMAINING_SIGMA_C if unit == "C" else MIN_REMAINING_SIGMA_C * 9 / 5
+    return max(floor, full_sigma * sqrt(left / window))
 
 
 def evaluate(
@@ -345,6 +470,7 @@ def evaluate(
             "bias": bias,
             "sigma": fit["sigma"] if fit else fallback_sigma,
             "calibration_days": fit["days"] if fit else 0,
+            "calibration_source": fit.get("source", "event_backfill") if fit else None,
             "fetched_at": item["fetched_at"],
             "batch_id": item["batch_id"],
         })
@@ -356,25 +482,59 @@ def evaluate(
             context = hourly_context.get(str(component["model"]), {})
             remaining_max = context.get("remaining_hourly_max")
             target_count = int(context.get("target_hourly_count") or 0)
+            full_sigma = float(component["sigma"])
             if remaining_max is not None:
                 biased_remaining_max = float(remaining_max) + float(component["bias"])
                 component["remaining_hourly_max"] = biased_remaining_max
+                component["remaining_mean"] = biased_remaining_max
+                component["remaining_sigma"] = remaining_sigma(full_sigma, as_of, tz, unit)
                 component["mean"] = max(float(observed["high"]), biased_remaining_max)
                 component["in_day_mean_source"] = "observed_high_plus_remaining_hourly"
             elif target_count > 0:
+                # Forecast has no hours left today: the day is effectively over.
                 component["remaining_hourly_max"] = None
+                component["remaining_mean"] = float(observed["high"]) - 10.0 * full_sigma
+                component["remaining_sigma"] = full_sigma
                 component["mean"] = float(observed["high"])
                 component["in_day_mean_source"] = "observed_high_no_remaining_hours"
             else:
+                # No hourly data: remaining max ~ daily forecast, still capped below by the observation.
                 component["remaining_hourly_max"] = None
+                component["remaining_mean"] = float(component["daily_mean"])
+                component["remaining_sigma"] = remaining_sigma(full_sigma, as_of, tz, unit)
                 component["in_day_mean_source"] = "daily_max_fallback_no_hourly"
+    combined = None
+    if not observed:
+        lead = max(0, (date.fromisoformat(target) - as_of.astimezone(tz).date()).days)
+        combined = combined_fit(db, city, unit, lead, as_of, tz,
+                                [str(c["model"]) for c in components],
+                                COMBINED_SIGMA_FLOOR_C if unit == "C" else COMBINED_SIGMA_FLOOR_C * 9 / 5)
+        if combined:
+            combined["mean"] = sum(
+                combined["weights"][str(c["model"])]
+                * (to_unit(forecasts[str(c["model"])]["temperature_c"], unit)
+                   + combined["model_bias"][str(c["model"])])
+                for c in components) + combined["bias"]
     probs = []
     for mid, label, lo, hi, _ in bins:
-        if observed:
+        if combined:
+            p = probability(lo, hi, combined["mean"], combined["sigma"])
+        elif observed:
             p = observed_floor_probability(lo, hi, components, observed["high"])
         else:
-            p = sum(probability(lo, hi, c["mean"], c["sigma"]) for c in components) / len(components)
-        probs.append({"market_id": mid, "bracket": label, "p_yes": p, "p_no": 1 - p})
+            p = sum(w * probability(lo, hi, c["mean"], c["sigma"])
+                    for c, w in zip(components, component_weights(components)))
+        locked_no = False
+        if observed and hi is not None:
+            margin = LOCK_MARGIN_C if unit == "C" else LOCK_MARGIN_C * 9 / 5
+            confirmed = observed.get("confirmed_high")
+            # Sanity guard: a "lock" far above every forecast is more likely a data/unit
+            # error than a real record high, so don't treat it as certain.
+            plausible = confirmed is not None and float(confirmed) <= max(
+                float(c["daily_mean"]) for c in components) + (LOCK_PLAUSIBLE_C if unit == "C" else LOCK_PLAUSIBLE_C * 9 / 5)
+            locked_no = plausible and float(confirmed) >= hi + 0.5 + margin
+        probs.append({"market_id": mid, "bracket": label, "p_yes": p, "p_no": 1 - p,
+                      "locked_no": locked_no})
     total = sum(p["p_yes"] for p in probs)
     if abs(total - 1) > 1e-8:
         raise ValueError(f"Event {eid}: probabilities do not cover the event: {total}")
@@ -405,6 +565,7 @@ def evaluate(
         "in_day_observation": observed,
         "in_day_hourly_context": hourly_context,
         "in_day_observations_modeled": bool(observed),
+        "combined": combined,
         "probabilities": probs,
     }
     if persist:

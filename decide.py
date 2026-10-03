@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import sqlite3
 
-from edge import book_history, quoted_book
+from edge import quoted_book, recent_book_history
 from filters import Policy, assess
 from probability import evaluate, parse_time
 
@@ -52,9 +52,10 @@ def event_decisions(
     }
 
     if history is None:
-        history = book_history(
+        history = recent_book_history(
             db,
-            {token for _, token, _, _, _ in markets},
+            {str(token) for _, token, _, _, _ in markets if token},
+            as_of,
         )
 
     tz_row = db.execute(

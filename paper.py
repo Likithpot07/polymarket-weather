@@ -10,7 +10,7 @@ from pathlib import Path
 import sqlite3
 
 from collector import GAMMA, get_json
-from edge import book_history, quoted_book
+from edge import book_history, quoted_book, recent_book_history
 from probability import parse_time
 
 PAPER_DDL = """
@@ -93,10 +93,13 @@ def _finite_float(value) -> float | None:
 
 
 def best_no_trade(decisions: list[dict]) -> dict | None:
-    """Among eligible NO trades in this city-day, pick the one the MARKET
-    is most confident is excluded (lowest ask) — not the one our model
-    disagrees with the market on the most. A big model-vs-market gap is
-    usually our model being wrong, not a real edge."""
+    """Pick the NO the evidence is most sure of.
+
+    Locked brackets (already ruled out by today's observed high) come first,
+    then the highest blended win probability, then edge. The previous rule took
+    the *lowest* NO ask, which is the bracket the market thinks is MOST likely to
+    happen, i.e. it systematically bet against the favourite.
+    """
     candidates = [
         decision for decision in decisions
         if decision.get("action") == "TRADE"
@@ -104,14 +107,15 @@ def best_no_trade(decisions: list[dict]) -> dict | None:
     ]
     if not candidates:
         return None
-    return min(
-        candidates,
-        key=lambda decision: (
-            _finite_float(decision.get("best_ask"))
-            if _finite_float(decision.get("best_ask")) is not None
-            else float("inf")
-        ),
-    )
+
+    def key(decision: dict):
+        probability = _finite_float(decision.get("blended_probability"))
+        if probability is None:
+            probability = _finite_float(decision.get("model_probability")) or 0.0
+        edge = _finite_float(decision.get("net_edge")) or 0.0
+        return (bool(decision.get("locked_no")), probability, edge)
+
+    return max(candidates, key=key)
 
 
 def position_deteriorated(
@@ -137,6 +141,22 @@ def position_deteriorated(
         and current_probability <= entry_probability - probability_drop
     )
     return probability_bad
+
+
+def locked_candidates(db: sqlite3.Connection, event_id: str, decisions: list[dict]) -> list[dict]:
+    """Locked-NO trades on markets we have not already bought (each lock is its own sure trade)."""
+    taken = {
+        str(row[0]) for row in db.execute(
+            """SELECT market_id FROM paper_orders
+               WHERE event_id=? AND side='NO' AND status!='NO_FILL'""",
+            (event_id,),
+        )
+    }
+    return [
+        d for d in decisions
+        if d.get("action") == "TRADE" and str(d.get("side")).upper() == "NO"
+        and d.get("locked_no") and str(d.get("market_id")) not in taken
+    ]
 
 
 def city_day_gate(
@@ -309,7 +329,7 @@ def process_pending_orders(
         (order_id, token, execute_after, desired, max_price, event_id,
          market_id, side, bracket, signal_ask) = row
         execution_time = parse_time(str(execute_after))
-        history = book_history(db, {str(token)}).get(str(token), [])
+        history = recent_book_history(db, {str(token)}, execution_time).get(str(token), [])
         quote = quoted_book(history, execution_time, pcfg["max_book_age_seconds"])
         if not quote or not quote.get("depth_verified") or not quote.get("ask_levels"):
             reason = "NO_VERIFIED_BOOK_AT_EXECUTION"
@@ -556,10 +576,54 @@ def stats(db: sqlite3.Connection) -> dict:
     }
 
 
+STRATEGY_START = "2026-10-01T00:00:00+00:00"  # when the fixed bot started placing bets
+
+
+def recent_stats(db: sqlite3.Connection, since: str) -> dict:
+    """Plain-English summary of paper bets placed since `since`, split by days before the target date."""
+    from datetime import date as _date
+    from zoneinfo import ZoneInfo
+    groups: dict[str, dict] = {}
+    rows = db.execute(
+        """SELECT p.status,p.signal_at,p.total_cost,p.pnl,m.target_date,l.timezone
+           FROM paper_orders p JOIN markets m ON m.id=p.market_id
+           LEFT JOIN locations l ON l.city=m.city
+           WHERE p.signal_at >= ?""", (since,)).fetchall()
+    for status, signal_at, cost, pnl, target, tz_name in rows:
+        try:
+            local = parse_time(str(signal_at)).astimezone(ZoneInfo(tz_name or "UTC")).date()
+            lead = (_date.fromisoformat(str(target)) - local).days
+        except (TypeError, ValueError):
+            lead = None
+        key = ("same day (locked trades)" if lead == 0 else "1 day before" if lead == 1
+               else "2+ days before (forecast bets)" if lead is not None else "unknown")
+        g = groups.setdefault(key, {"bets_placed": 0, "waiting_to_settle": 0, "failed_to_fill": 0,
+                                    "settled": 0, "wins": 0, "losses": 0, "profit_usd": 0.0,
+                                    "money_in_settled_bets": 0.0})
+        g["bets_placed"] += 1
+        if status in ("FILLED", "PARTIAL", "PENDING"):
+            g["waiting_to_settle"] += 1
+        elif status == "NO_FILL":
+            g["failed_to_fill"] += 1
+        elif status in ("SETTLED_WIN", "SETTLED_LOSS"):
+            g["settled"] += 1
+            g["wins" if status == "SETTLED_WIN" else "losses"] += 1
+            g["profit_usd"] += float(pnl or 0)
+            g["money_in_settled_bets"] += float(cost or 0)
+    for g in groups.values():
+        g["profit_usd"] = round(g["profit_usd"], 2)
+        g["return_pct"] = (round(100 * g["profit_usd"] / g["money_in_settled_bets"], 1)
+                           if g["money_in_settled_bets"] else None)
+        g["money_in_settled_bets"] = round(g["money_in_settled_bets"], 2)
+    return groups
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.json")
     parser.add_argument("command", choices=("status", "settle"))
+    parser.add_argument("--since", default=STRATEGY_START,
+                        help="Only count bets placed after this time for the 'since fixes' section")
     args = parser.parse_args()
     config_path = Path(args.config).resolve()
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
@@ -573,7 +637,10 @@ def main() -> None:
             settled = settle_positions(db, datetime.now(timezone.utc), cfg)
             print(json.dumps({"settled_now": settled, "stats": stats(db)}, indent=2))
         else:
-            print(json.dumps(stats(db), indent=2))
+            print(json.dumps({
+                "ALL_TIME_including_old_broken_bot": stats(db),
+                f"SINCE_FIXES (bets placed after {args.since})": recent_stats(db, args.since),
+            }, indent=2))
 
 
 if __name__ == "__main__":

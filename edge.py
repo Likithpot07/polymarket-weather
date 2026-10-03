@@ -43,6 +43,45 @@ def _levels(raw_levels) -> dict[float, float]:
     return result
 
 
+def _row_event(row_id, token, received, kind, raw, bid, ask) -> dict | None:
+    try:
+        when = parse_time(received)
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            payload = {}
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+    return {"id": int(row_id), "token_id": str(token), "received_at": when, "event_type": str(kind),
+            "raw": payload, "best_bid": bid, "best_ask": ask}
+
+
+def recent_book_history(db: sqlite3.Connection, tokens: set[str], as_of: datetime,
+                        fallback_hours: float = 3.0) -> dict[str, list[dict]]:
+    """Only what quoted_book needs: from the latest full snapshot at/before as_of up to as_of.
+
+    Loading a token's whole history (the old way) made live.py take an hour per cycle
+    on a large database.
+    """
+    from datetime import timedelta
+    history: dict[str, list[dict]] = {token: [] for token in tokens}
+    end = as_of.isoformat()
+    for token in tokens:
+        anchor = db.execute(
+            """SELECT received_at FROM book_events
+               WHERE token_id=? AND event_type='book' AND received_at<=?
+               ORDER BY received_at DESC LIMIT 1""", (token, end)).fetchone()
+        start = anchor[0] if anchor else (as_of - timedelta(hours=fallback_hours)).isoformat()
+        for row in db.execute(
+                """SELECT id,token_id,received_at,event_type,raw_json,best_bid,best_ask FROM book_events
+                   WHERE token_id=? AND received_at>=? AND received_at<=?
+                     AND event_type IN ('book','price_change','best_bid_ask')
+                   ORDER BY received_at,id""", (token, start, end)):
+            event = _row_event(*row)
+            if event:
+                history[token].append(event)
+    return history
+
+
 def book_history(db: sqlite3.Connection, tokens: set[str]) -> dict[str, list[dict]]:
     """Load only the requested tokens, preserving snapshots and incremental book changes."""
     history: dict[str, list[dict]] = {token: [] for token in tokens}

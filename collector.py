@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
@@ -24,6 +24,7 @@ LOG = logging.getLogger("collector")
 _APP_DNS_HOSTS = {
     "gamma-api.polymarket.com",
     "ws-subscriptions-clob.polymarket.com",
+    "clob.polymarket.com",
 }
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 def _cloudflare_app_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -119,6 +120,11 @@ def get_json(url: str, retries: int = 5) -> dict | list:
             with urlopen(request, timeout=25) as response:
                 raw = response.read()
             return json.loads(raw.decode("utf-8"))
+        except HTTPError as exc:
+            # 4xx (e.g. 404 for a slug that doesn't exist yet) won't fix itself on retry.
+            if 400 <= exc.code < 500 and exc.code != 429:
+                raise
+            last_error = exc
         except (IncompleteRead, URLError, TimeoutError, ConnectionResetError, OSError) as exc:
             last_error = exc
         except json.JSONDecodeError as exc:
@@ -138,7 +144,9 @@ def get_json(url: str, retries: int = 5) -> dict | list:
 def db_open(path: str) -> sqlite3.Connection:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    db = sqlite3.connect(target)
+    # Wait up to 60s for other scripts (live.py, backtests) instead of crashing.
+    db = sqlite3.connect(target, timeout=60)
+    db.execute("PRAGMA busy_timeout=60000")
     db.execute("PRAGMA foreign_keys=ON")
     db.executescript(DDL)
     return db
@@ -211,7 +219,12 @@ def parse_rule_metadata(
         if re.fullmatch(r"[A-Z0-9]{4,6}", candidate):
             station = candidate
     unit = None
-    if re.search(r"degrees?\s+Fahrenheit|°F", text, re.I):
+    # The settlement clause ("whole degrees Celsius") is the most reliable signal;
+    # rule text sometimes mentions the other scale elsewhere.
+    whole = re.search(r"whole\s+degrees?\s+(Fahrenheit|Celsius)", text, re.I)
+    if whole:
+        unit = whole.group(1)[0].upper()
+    elif re.search(r"degrees?\s+Fahrenheit|°F", text, re.I):
         unit = "F"
     elif re.search(r"degrees?\s+Celsius|°C", text, re.I):
         unit = "C"
@@ -287,6 +300,31 @@ def save_event(db: sqlite3.Connection, event: dict) -> dict[str, str]:
     return token_map
 async def fetch(url: str) -> dict | list:
     return await asyncio.to_thread(get_json, url)
+SLUG_PATTERN = re.compile(r"^highest-temperature-in-(.+)-on-[a-z]+-\d{1,2}-20\d\d$")
+_MISSING_SLUGS: dict[str, float] = {}
+
+
+def upcoming_slugs(db: sqlite3.Connection, days_ahead: int, today=None) -> list[str]:
+    """Slugs for every known city for today..today+days_ahead that we haven't saved yet.
+
+    Search results are capped and favour busy markets, so newly listed events a few
+    days out were often missed; those early markets are where a forecast can beat
+    the price. Polymarket names these events predictably, so ask for them directly.
+    """
+    today = today or datetime.now(timezone.utc).date()
+    known = {str(row[0]) for row in db.execute("SELECT slug FROM events WHERE slug IS NOT NULL")}
+    cities = sorted({m.group(1) for s in known if (m := SLUG_PATTERN.match(s))})
+    slugs = []
+    for offset in range(-1, days_ahead + 1):
+        day = today + timedelta(days=offset)
+        suffix = f"on-{day.strftime('%B').lower()}-{day.day}-{day.year}"
+        for city in cities:
+            slug = f"highest-temperature-in-{city}-{suffix}"
+            if slug not in known:
+                slugs.append(slug)
+    return slugs
+
+
 async def scan(db: sqlite3.Connection, cfg: dict) -> dict[str, str]:
     token_map: dict[str, str] = {}
     seen: set[str] = set()
@@ -326,6 +364,23 @@ async def scan(db: sqlite3.Connection, cfg: dict) -> dict[str, str]:
                 token_map.update(save_event(db, detail))
             except (HTTPError, URLError, ValueError, KeyError, TypeError) as exc:
                 LOG.error("Gamma event %s failed: %s", eid, exc)
+    found = 0
+    for slug in upcoming_slugs(db, int(cfg.get("discovery_days_ahead", 3))):
+        if time.monotonic() - _MISSING_SLUGS.get(slug, -1e9) < 3600:
+            continue
+        try:
+            detail = await fetch(f"{GAMMA}/events/slug/{quote(slug, safe='')}")
+            if isinstance(detail, dict) and detail.get("id") and candidate_event(detail):
+                if str(detail["id"]) not in seen:
+                    seen.add(str(detail["id"]))
+                    token_map.update(save_event(db, detail))
+                    found += 1
+            else:
+                _MISSING_SLUGS[slug] = time.monotonic()
+        except (HTTPError, URLError, ValueError, KeyError, TypeError):
+            _MISSING_SLUGS[slug] = time.monotonic()
+    if found:
+        LOG.info("Early discovery: %d new events found by slug", found)
     for slug in cfg["event_slugs"]:
         try:
             detail = await fetch(f"{GAMMA}/events/slug/{quote(slug, safe='')}")
@@ -361,6 +416,44 @@ async def location_for(db: sqlite3.Connection, cfg: dict, city: str) -> dict | N
                (city, data["latitude"], data["longitude"], data["timezone"], source, json.dumps(data)))
     db.commit()
     return data
+_STATION_CACHE: dict[str, tuple[float, float, str]] = {}
+
+
+def station_coordinates(db: sqlite3.Connection, city: str) -> tuple[float, float, str] | None:
+    """Lat/lon of the airport station that settles this city's markets.
+
+    Markets resolve on one airport (e.g. NYC -> LaGuardia), which can be several
+    degrees warmer/cooler than the geocoded city centre. Coordinates come from the
+    METAR payloads already stored, so nothing is hard-coded or guessed.
+    """
+    if city in _STATION_CACHE:
+        return _STATION_CACHE[city]
+    # Fast path: one recent market for the city, then its latest observation via the
+    # (market_id, ...) index. The old join scanned the whole observations table.
+    row = None
+    for market_id, station in db.execute(
+            """SELECT m.id,r.station FROM markets m JOIN rule_reviews r ON r.market_id=m.id
+               WHERE m.city=? AND r.station IS NOT NULL ORDER BY m.target_date DESC LIMIT 5""",
+            (city,)):
+        hit = db.execute(
+            "SELECT raw_json FROM observations WHERE market_id=? AND station=? ORDER BY observed_at DESC LIMIT 1",
+            (market_id, station)).fetchone()
+        if hit:
+            row = (station, hit[0])
+            break
+    if not row:
+        return None
+    try:
+        raw = json.loads(row[1] or "{}")
+        lat, lon = float(raw["lat"]), float(raw["lon"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    _STATION_CACHE[city] = (lat, lon, str(row[0]))
+    return _STATION_CACHE[city]
+
+
 async def collect_forecasts(db: sqlite3.Connection, cfg: dict) -> None:
     cities = [row[0] for row in db.execute("SELECT DISTINCT city FROM markets WHERE city IS NOT NULL AND active=1")]
     for city in cities:
@@ -371,8 +464,13 @@ async def collect_forecasts(db: sqlite3.Connection, cfg: dict) -> None:
             continue
         if not loc:
             continue
+        latitude, longitude = loc["latitude"], loc["longitude"]
+        if cfg.get("forecast_at_station", True):
+            station = station_coordinates(db, city)
+            if station:
+                latitude, longitude, _ = station
         for model in cfg["weather_models"]:
-            params = dict(latitude=loc["latitude"], longitude=loc["longitude"],
+            params = dict(latitude=latitude, longitude=longitude,
                           timezone=loc["timezone"], models=model, hourly="temperature_2m",
                           daily="temperature_2m_max", temperature_unit="celsius",
                           forecast_days=cfg["forecast_days"])

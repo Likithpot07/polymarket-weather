@@ -28,7 +28,7 @@
     "notional_usd": 10,
     "latency_ms": 1000,
     "max_slippage_per_share": 0.03,
-    "max_book_age_seconds": 30,
+    "max_book_age_seconds": 10800,
     "settlement_check_seconds": 300,
     "max_trades_per_city_day": 1,
     "deterioration_probability_drop": 0.15
@@ -38,7 +38,15 @@
       "NO"
     ],
     "min_no_probability": 0.7,
-    "max_model_market_gap": 0.4
+    "max_model_market_gap": 0.4,
+    "model_weight": 0.5,
+    "trade_locked_no": true,
+    "min_locked_net_edge": 0.01,
+    "locked_only": false,
+    "max_forecast_sigma_c": 1.5,
+    "min_forecast_lead_days": 2,
+    "min_net_edge": 0.04,
+    "max_book_age_seconds": 10800
   },
   "dataset_cities": [
     "Atlanta",
@@ -52,5 +60,7 @@
     "NYC",
     "San Francisco",
     "Seattle"
-  ]
+  ],
+  "forecast_at_station": true,
+  "discovery_days_ahead": 3
 }

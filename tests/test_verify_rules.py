@@ -1,3 +1,4 @@
+import re
 import unittest
 
 from verify_rules import verify_event_payload
@@ -69,11 +70,18 @@ class VerifyRulesTest(unittest.TestCase):
         self.assertEqual(result["unit"], "C")
         self.assertEqual(result["rounding"], "whole degree")
 
-    def test_rejects_missing_hourly_data_clause(self):
+    def test_accepts_reworded_hourly_data_clause(self):
+        # Newer Polymarket rules dropped this wording; it doesn't change settlement.
         event = valid_event()
         for market in event["markets"]:
             market["description"] = market["description"].replace("Hourly Data", "data")
-        with self.assertRaisesRegex(ValueError, "hourly_data"):
+        self.assertEqual(verify_event_payload(event)["station"], "KLGA")
+
+    def test_rejects_missing_whole_degree_clause(self):
+        event = valid_event()
+        for market in event["markets"]:
+            market["description"] = re.sub(r"whole\s+degrees?", "degrees", market["description"], flags=re.I)
+        with self.assertRaises(ValueError):
             verify_event_payload(event)
 
     def test_rejects_station_source_mismatch(self):
