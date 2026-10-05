@@ -9,6 +9,11 @@ from pathlib import Path
 import sqlite3
 import time
 
+import os
+import re
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
 from decide import event_decisions
 from filters import Policy
 from paper import PAPER_DDL, best_no_trade, city_day_gate, locked_candidates, process_pending_orders, schedule_order, settle_positions, stats as paper_stats
@@ -360,6 +365,35 @@ def format_trade(decision: dict) -> str:
     )
 
 
+def load_env(path: Path) -> None:
+    """Read KEY=value lines from .env into os.environ (no extra package needed)."""
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def telegram(text: str) -> None:
+    """Send a Telegram message if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set. Never crashes the bot."""
+    token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
+    if not token or not chat:
+        return
+    try:
+        data = urlencode({"chat_id": chat, "text": text}).encode()
+        with urlopen(Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data), timeout=10) as r:
+            r.read()
+    except Exception as exc:  # network trouble must not stop trading
+        print(f"TELEGRAM FAILED | {re.sub(r'bot[0-9]+:[A-Za-z0-9_-]+', 'bot***', str(exc))}", flush=True)
+
+
+def short_question(text: str | None) -> str:
+    m = re.search(r"in (.+?) be (.+?)(?: on |\?|$)", text or "")
+    return f"{m.group(1)}: {m.group(2)}" if m else (text or "")[:60]
+
+
 def run_cycle(
     db: sqlite3.Connection,
     policy: Policy,
@@ -481,12 +515,22 @@ def run_cycle(
             f"{item.get('bracket')}",
             flush=True,
         )
+        telegram(f"🟦 NEW BET (paper)\nNO on {short_question(item.get('bracket'))}\n"
+                 f"Paid ${item['total_cost']:.2f} at {item['vwap']:.2f} | win pays ${item['filled_shares']:.2f}")
     for item in settled:
         print(
             f"PAPER SETTLED | {item['side']} | {item['status']} | "
             f"pnl={item['pnl']:+.2f}",
             flush=True,
         )
+        row = db.execute("SELECT bracket FROM paper_orders WHERE id=?", (item["order_id"],)).fetchone()
+        won = item["status"] == "SETTLED_WIN"
+        telegram(f"{'✅ WON' if won else '❌ LOST'} {item['pnl']:+.2f} USD (paper)\n"
+                 f"NO on {short_question(row[0] if row else '')}")
+    if settled:
+        st = paper_stats(db)
+        telegram(f"📊 All-time paper P&L: {st['realized_pnl']:+.2f} USD | "
+                 f"{st['wins']} wins / {st['losses']} losses")
     summary["paper"] = paper_stats(db)
     return summary
 
@@ -500,6 +544,8 @@ def main() -> None:
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
+    load_env(config_path.parent / ".env")
+    telegram("🤖 Weather bot (live.py) started - paper mode")
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
     db_path = Path(cfg["db_path"])
     if not db_path.is_absolute():

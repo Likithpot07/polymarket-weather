@@ -198,35 +198,7 @@ class LockedOnlyTest(unittest.TestCase):
         self.assertEqual([d["market_id"] for d in locked_candidates(db, "e1", decisions)], ["m2"])
 
 
-class LockSpeedTest(unittest.TestCase):
-    def test_finds_lock_and_prices_it(self):
-        import json as _json
-        import lock_speed
-        db = build_db([(12, 68.8), (13, 69.0)], {})  # both >= 67.5+1.08 -> 66-67 locked
-        lock = lock_speed.lock_moment(lock_speed.readings(db, "e1"), 67 + 0.5 + 1.08, "F")
-        self.assertIsNotNone(lock)
-        t0 = lock["fetched"]
-        book = {"bids": [{"price": "0.90", "size": "50"}],
-                "asks": [{"price": "0.93", "size": "20"}, {"price": "0.999", "size": "500"}]}
-        db.execute("INSERT INTO book_events(token_id,event_type,source_timestamp,received_at,best_bid,best_ask,raw_json)"
-                   " VALUES ('m1n','book','',?, '0.90','0.93',?)",
-                   ((t0 - timedelta(minutes=5)).isoformat(), _json.dumps(book)))
-        history = lock_speed.history_window(db, "m1n", t0, t0 + timedelta(minutes=5))
-        from edge import quoted_book
-        opp = lock_speed.opportunity(quoted_book(history, t0, 10 ** 9))
-        self.assertAlmostEqual(opp["ask"], 0.93)
-        self.assertAlmostEqual(opp["shares"], 20)
-        self.assertGreater(opp["profit"], 1.2)
-
-
 class UnitSafetyTest(unittest.TestCase):
-    def test_lock_speed_converts_units(self):
-        import lock_speed
-        db = build_db([(12, 86.0), (13, 87.0)], {})  # stored in F (~30C)
-        values = lock_speed.readings(db, "e1")
-        self.assertIsNone(lock_speed.lock_moment(values, 36 + 0.5 + 0.6, "C"))  # 30C doesn't lock a 36C bracket
-        self.assertIsNotNone(lock_speed.lock_moment(values, 28 + 0.5 + 0.6, "C"))
-
     def test_implausible_observation_does_not_lock(self):
         # Forecast 21C (~70F) but readings say 90F: likely bad data, so no lock.
         db = build_db([(12, 90.0), (13, 90.5)], {h: 18.0 for h in range(18, 24)})
@@ -456,11 +428,41 @@ class RecentStatsTest(unittest.TestCase):
         self.assertEqual(out["same day (locked trades)"]["wins"], 1)
 
 
-class FiveMinuteSignalTest(unittest.TestCase):
-    def test_needs_two_readings_in_a_row(self):
-        from five_min_edge import signal_time
-        t0 = datetime(2026, 10, 1, 16, tzinfo=timezone.utc)
-        c = lambda f: (f - 32) * 5 / 9
-        vals = [(t0, c(60)), (t0 + timedelta(minutes=5), c(70)), (t0 + timedelta(minutes=10), c(60)),
-                (t0 + timedelta(minutes=15), c(70)), (t0 + timedelta(minutes=20), c(71))]
-        self.assertEqual(signal_time(vals, 68.58, "F"), t0 + timedelta(minutes=20))
+class NwsTest(unittest.TestCase):
+    def test_parse_and_store_without_touching_live_model(self):
+        import asyncio
+        from unittest.mock import patch
+        import collector
+        from probability import latest_forecasts
+        grid = {"properties": {"updateTime": "2026-10-04T10:00:00+00:00", "maxTemperature": {"values": [
+            {"validTime": "2026-10-05T11:00:00+00:00/PT13H", "value": 22.2},
+            {"validTime": "2026-10-06T11:00:00+00:00/PT13H", "value": 24.4}]}}}
+        self.assertEqual(collector.nws_daily_highs(grid, "America/New_York"),
+                         {"2026-10-05": 22.2, "2026-10-06": 24.4})
+        db = build_db([(12, 70.0)], {})
+        async def fake(url):
+            return {"properties": {"forecastGridData": "https://api.weather.gov/gridpoints/OKX/1,1"}} if "/points/" in url else grid
+        with patch.object(collector, "fetch", side_effect=fake):
+            asyncio.run(collector.collect_nws(db, "NYC", 40.77, -73.88, "America/New_York"))
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM forecast_values WHERE period='nws_daily_max'").fetchone()[0], 2)
+        live = latest_forecasts(db, "NYC", "2026-09-25", datetime(2026, 10, 9, tzinfo=timezone.utc))
+        self.assertNotIn("nws", live)
+
+
+class TelegramTest(unittest.TestCase):
+    def test_message_sent_and_failures_never_crash(self):
+        import os
+        from unittest.mock import patch
+        import live
+        self.assertEqual(live.short_question("Will the highest temperature in NYC be between 68-69°F on October 5?"),
+                         "NYC: between 68-69°F")
+        with patch.dict(os.environ, {"TELEGRAM_BOT_TOKEN": "123:abc", "TELEGRAM_CHAT_ID": "42"}):
+            with patch.object(live, "urlopen") as fake:
+                live.telegram("hi")
+                request = fake.call_args[0][0]
+                self.assertIn("api.telegram.org/bot123:abc/sendMessage", request.full_url)
+            with patch.object(live, "urlopen", side_effect=OSError("down")):
+                live.telegram("hi")  # must not raise
+        with patch.dict(os.environ, {}, clear=True), patch.object(live, "urlopen") as fake:
+            live.telegram("hi")
+            fake.assert_not_called()

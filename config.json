@@ -25,7 +25,7 @@
   "max_tokens_per_socket": 200,
   "paper": {
     "enabled": true,
-    "notional_usd": 10,
+    "notional_usd": 30,
     "latency_ms": 1000,
     "max_slippage_per_share": 0.03,
     "max_book_age_seconds": 10800,

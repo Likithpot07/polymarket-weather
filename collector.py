@@ -25,6 +25,7 @@ _APP_DNS_HOSTS = {
     "gamma-api.polymarket.com",
     "ws-subscriptions-clob.polymarket.com",
     "clob.polymarket.com",
+    "data-api.polymarket.com",
 }
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 def _cloudflare_app_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -496,6 +497,57 @@ async def collect_forecasts(db: sqlite3.Connection, cfg: dict) -> None:
                 LOG.info("FORECAST %s %s | %d hourly values", city, model, len(hourly["time"]))
             except (HTTPError, URLError, ValueError) as exc:
                 LOG.error("Forecast %s %s failed: %s", city, model, exc)
+        if cfg.get("collect_nws", True):
+            await collect_nws(db, city, latitude, longitude, loc["timezone"])
+
+
+NWS_POINTS = "https://api.weather.gov/points"
+_NWS_GRID: dict[str, str] = {}
+
+
+def nws_daily_highs(grid: dict, timezone_name: str) -> dict[str, float]:
+    """{local_date: forecast high C} from an api.weather.gov gridpoint payload."""
+    tz = ZoneInfo(timezone_name)
+    out: dict[str, float] = {}
+    for item in ((grid.get("properties") or {}).get("maxTemperature") or {}).get("values") or []:
+        try:
+            start = datetime.fromisoformat(str(item["validTime"]).split("/")[0])
+            value = float(item["value"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        day = start.astimezone(tz).date().isoformat()
+        out[day] = max(value, out.get(day, value))
+    return out
+
+
+async def collect_nws(db: sqlite3.Connection, city: str, lat: float, lon: float, timezone_name: str) -> None:
+    """US National Weather Service forecast high (human-adjusted), saved for later comparison only.
+
+    Stored as model 'nws' with period 'nws_daily_max', so the live model ignores it
+    until it has proven itself against our current forecasts.
+    """
+    station = station_coordinates(db, city)
+    if not station or not station[2].startswith("K"):
+        return  # US airports only
+    try:
+        if city not in _NWS_GRID:
+            point = await fetch(f"{NWS_POINTS}/{lat:.4f},{lon:.4f}")
+            _NWS_GRID[city] = str(point["properties"]["forecastGridData"])
+        grid = await fetch(_NWS_GRID[city])
+        highs = nws_daily_highs(grid, timezone_name)
+        if not highs:
+            raise ValueError("no maxTemperature values")
+        with db:
+            cursor = db.execute(
+                "INSERT INTO forecast_batches(city,model,fetched_at,model_run_at,endpoint,raw_json) VALUES (?,?,?,?,?,?)",
+                (city, "nws", utc_now(), (grid.get("properties") or {}).get("updateTime"), _NWS_GRID[city], "{}"))
+            db.executemany("INSERT INTO forecast_values VALUES (?,?,?,?)",
+                           [(cursor.lastrowid, "nws_daily_max", day, value) for day, value in highs.items()])
+        LOG.info("FORECAST %s nws | %d days", city, len(highs))
+    except (HTTPError, URLError, ValueError, KeyError, TypeError) as exc:
+        LOG.warning("NWS forecast %s failed: %s", city, exc)
+
+
 def convert_temperature(value_c: float, unit: str | None) -> tuple[float, str]:
     if str(unit or "").upper() == "F":
         return value_c * 9.0 / 5.0 + 32.0, "F"
