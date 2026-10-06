@@ -18,6 +18,10 @@
   "forecast_days": 7,
   "city_locations": {},
   "live_interval_seconds": 30,
+  "keep_book_hours": 12,
+  "keep_decision_days": 7,
+  "prune_interval_hours": 6,
+  "decision_store_minutes": 10,
   "auto_prepare": true,
   "prepare_interval_seconds": 900,
   "prepare_retry_hours": 6,
@@ -46,6 +50,7 @@
     "max_forecast_sigma_c": 1.5,
     "min_forecast_lead_days": 2,
     "min_net_edge": 0.04,
+    "min_forecast_distance_sigma": 1.0,
     "max_book_age_seconds": 10800
   },
   "dataset_cities": [

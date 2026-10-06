@@ -41,7 +41,7 @@ def main() -> None:
                   m.city,m.target_date,m.question,l.timezone
            FROM paper_orders p JOIN markets m ON m.id=p.market_id
            LEFT JOIN locations l ON l.city=m.city
-           WHERE p.status IN ('FILLED','PARTIAL') AND p.settled_at IS NULL""").fetchall()
+           WHERE p.status IN ('FILLED','PARTIAL') AND p.settled_at IS NULL AND p.legacy=0""").fetchall()
     now = datetime.now(timezone.utc)
     today_ist = now.astimezone(IST).date()
     bets = []

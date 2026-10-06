@@ -7,7 +7,7 @@ import math
 from zoneinfo import ZoneInfo
 
 from edge import buy_edge
-from probability import parse_time
+from probability import bracket as parse_bracket, parse_time
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,10 @@ class Policy:
     # Forecast (non-locked) bets only this many days or more before the target day.
     # backtest_early.py: 2 days ahead was the best (+6-8%), 1 day ahead marginal.
     min_forecast_lead_days: int = 0
+    # NO forecast bets only when the forecast high sits at least this many sigmas
+    # (typical forecast errors) outside the bracket. check_losse.py: bets under 1 sigma
+    # lost 5 of 9 (-$30), bets at 1+ sigma lost 3 of 41 (+$96). 0 = off.
+    min_forecast_distance_sigma: float = 0.0
 
     @classmethod
     def from_config(cls, cfg: dict) -> "Policy":
@@ -65,7 +69,7 @@ class Policy:
                     "weather_fee_rate", "slippage_per_share", "min_no_probability",
                     "max_model_market_gap", "model_weight", "min_locked_net_edge",
                     "locked_slippage_per_share", "max_fade_market_yes",
-                    "max_forecast_sigma_c"):
+                    "max_forecast_sigma_c", "min_forecast_distance_sigma"):
             value = getattr(policy, key)
             if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise ValueError(f"{key} must be a nonnegative finite number")
@@ -74,6 +78,32 @@ class Policy:
         if policy.min_models < 1:
             raise ValueError("min_models must be positive")
         return policy
+
+
+def forecast_distance_sigma(state: dict, bracket_text: str) -> float | None:
+    """How many sigmas the forecast high sits outside the bracket (negative = inside)."""
+    parsed = parse_bracket(bracket_text)
+    components = state.get("components") or []
+    combined = state.get("combined")
+    if not parsed or not (combined or components):
+        return None
+    lo, hi, _ = parsed
+    if combined:
+        mean, sigma = float(combined["mean"]), float(combined["sigma"])
+    else:
+        mean = sum(float(c["mean"]) for c in components) / len(components)
+        sigma = sum(float(c.get("sigma") or 0) for c in components) / len(components)
+    if sigma <= 0:
+        return None
+    low = -math.inf if lo is None else lo - 0.5
+    high = math.inf if hi is None else hi + 0.5
+    if mean < low:
+        gap = low - mean
+    elif mean > high:
+        gap = mean - high
+    else:
+        gap = -min(mean - low, high - mean)
+    return gap / sigma
 
 
 def assess(state: dict, outcome: dict, side: str, quote: dict | None,
@@ -171,6 +201,12 @@ def assess(state: dict, outcome: dict, side: str, quote: dict | None,
         result["best_sigma_c"] = best_sigma_c
         if best_sigma_c > policy.max_forecast_sigma_c + 1e-9:  # tolerance: F<->C rounding
             soft.append("FORECAST_TOO_UNCERTAIN")
+        if side == "NO" and not state.get("in_day_observations_modeled"):
+            distance = forecast_distance_sigma(state, outcome.get("bracket") or "")
+            result["forecast_distance_sigma"] = distance
+            if (policy.min_forecast_distance_sigma > 0 and distance is not None
+                    and distance < policy.min_forecast_distance_sigma):
+                soft.append("FORECAST_TOO_CLOSE_TO_BRACKET")
         if any((as_of - parse_time(c["fetched_at"])).total_seconds() >
                policy.max_forecast_age_hours * 3600 for c in components):
             hard.append("STALE_FORECAST")

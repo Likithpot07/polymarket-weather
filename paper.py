@@ -547,17 +547,19 @@ def settle_positions(db: sqlite3.Connection, as_of: datetime, cfg: dict) -> list
     return settled
 
 
-def stats(db: sqlite3.Connection) -> dict:
+def stats(db: sqlite3.Connection, legacy: int = 0) -> dict:
+    """Paper totals. legacy=0 -> new bot only (default), legacy=1 -> old broken bot only."""
     counts = defaultdict(int)
-    for status, count in db.execute("SELECT status,count(*) FROM paper_orders GROUP BY status"):
+    for status, count in db.execute(
+            "SELECT status,count(*) FROM paper_orders WHERE legacy=? GROUP BY status", (legacy,)):
         counts[str(status)] = int(count)
     realized_pnl, settled_cost = db.execute(
         """SELECT COALESCE(sum(pnl),0),COALESCE(sum(total_cost),0)
-           FROM paper_orders WHERE settled_at IS NOT NULL"""
+           FROM paper_orders WHERE settled_at IS NOT NULL AND legacy=?""", (legacy,)
     ).fetchone()
     open_cost = db.execute(
         """SELECT COALESCE(sum(total_cost),0) FROM paper_orders
-           WHERE status IN ('FILLED','PARTIAL') AND settled_at IS NULL"""
+           WHERE status IN ('FILLED','PARTIAL') AND settled_at IS NULL AND legacy=?""", (legacy,)
     ).fetchone()[0]
     return {
         "pending": counts["PENDING"],
@@ -579,6 +581,18 @@ def stats(db: sqlite3.Connection) -> dict:
 STRATEGY_START = "2026-10-01T00:00:00+00:00"  # when the fixed bot started placing bets
 
 
+def tag_legacy_orders(db: sqlite3.Connection) -> None:
+    """One-time: add a 'legacy' column and mark every bet from the old broken bot (before
+    STRATEGY_START) as legacy=1. Rows are kept, just ignored by stats and reports.
+    New bets default to legacy=0. Safe to call every start."""
+    cols = {row[1] for row in db.execute("PRAGMA table_info(paper_orders)")}
+    if "legacy" in cols:
+        return
+    db.execute("ALTER TABLE paper_orders ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0")
+    db.execute("UPDATE paper_orders SET legacy=1 WHERE signal_at < ?", (STRATEGY_START,))
+    db.commit()
+
+
 def recent_stats(db: sqlite3.Connection, since: str) -> dict:
     """Plain-English summary of paper bets placed since `since`, split by days before the target date."""
     from datetime import date as _date
@@ -588,7 +602,7 @@ def recent_stats(db: sqlite3.Connection, since: str) -> dict:
         """SELECT p.status,p.signal_at,p.total_cost,p.pnl,m.target_date,l.timezone
            FROM paper_orders p JOIN markets m ON m.id=p.market_id
            LEFT JOIN locations l ON l.city=m.city
-           WHERE p.signal_at >= ?""", (since,)).fetchall()
+           WHERE p.signal_at >= ? AND p.legacy=0""", (since,)).fetchall()
     for status, signal_at, cost, pnl, target, tz_name in rows:
         try:
             local = parse_time(str(signal_at)).astimezone(ZoneInfo(tz_name or "UTC")).date()
@@ -624,6 +638,8 @@ def main() -> None:
     parser.add_argument("command", choices=("status", "settle"))
     parser.add_argument("--since", default=STRATEGY_START,
                         help="Only count bets placed after this time for the 'since fixes' section")
+    parser.add_argument("--all", action="store_true",
+                        help="Also show the old broken bot's results (hidden by default)")
     args = parser.parse_args()
     config_path = Path(args.config).resolve()
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
@@ -633,14 +649,18 @@ def main() -> None:
     with sqlite3.connect(db_path, timeout=30) as db:
         db.execute("PRAGMA busy_timeout=30000")
         db.executescript(PAPER_DDL)
+        tag_legacy_orders(db)
         if args.command == "settle":
             settled = settle_positions(db, datetime.now(timezone.utc), cfg)
             print(json.dumps({"settled_now": settled, "stats": stats(db)}, indent=2))
         else:
-            print(json.dumps({
-                "ALL_TIME_including_old_broken_bot": stats(db),
-                f"SINCE_FIXES (bets placed after {args.since})": recent_stats(db, args.since),
-            }, indent=2))
+            report = {
+                "NEW_BOT_TOTAL": stats(db),
+                f"NEW_BOT_BY_BET_TYPE (placed after {args.since})": recent_stats(db, args.since),
+            }
+            if args.all:
+                report["OLD_BROKEN_BOT (hidden by default)"] = stats(db, legacy=1)
+            print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":

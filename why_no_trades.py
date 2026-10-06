@@ -1,6 +1,7 @@
 """Quick health check: is the collector feeding fresh data, and why isn't the bot trading?
 
     python why_no_trades.py
+    python why_no_trades.py --size     # what is taking space in the database (fast estimate)
 
 Read-only. Paste the output back to Claude.
 """
@@ -11,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 import json
 from pathlib import Path
 import sqlite3
+import sys
 from zoneinfo import ZoneInfo
 
 
@@ -24,9 +26,53 @@ def age(db, sql: str) -> str:
     return f"{minutes:.0f} min ago{flag}"
 
 
+SIZE_TABLES = {  # table -> timestamp column
+    "book_events": "received_at", "live_decisions": None, "live_decision_runs": "as_of",
+    "live_model_diagnostics": "as_of", "paper_candidate_audit": "as_of", "live_signal_state": None,
+    "paper_trades": "opened_at", "forecast_batches": "fetched_at", "forecast_values": None,
+    "observations": "fetched_at", "calibration_observations": None, "markets": None,
+    "events": None, "tokens": None, "paper_orders": "signal_at",
+}
+
+
+def size_report(db, db_path: Path) -> None:
+    """Fast estimate: rows = highest rowid, bytes/row from the newest 2000 rows."""
+    print("=== FILES ===")
+    for f in sorted(db_path.parent.glob("*.sqlite3*")):
+        print(f"  {f.name:<32} {f.stat().st_size / 1e9:8.2f} GB")
+    print("\n=== TABLES (estimated, biggest first) ===")
+    rows_out = []
+    for table, ts in SIZE_TABLES.items():
+        try:
+            hi = db.execute(f"SELECT MAX(rowid) FROM {table}").fetchone()[0]  # separate queries:
+            lo = db.execute(f"SELECT MIN(rowid) FROM {table}").fetchone()[0]  # each is instant
+        except sqlite3.Error:
+            continue
+        if hi is None:
+            continue
+        sample = db.execute(f"SELECT * FROM {table} WHERE rowid>?", (hi - 2000,)).fetchall()
+        per_row = sum(sum(len(str(v)) for v in r if v is not None) for r in sample) / max(1, len(sample))
+        span = ""
+        if ts:
+            try:
+                first = db.execute(f"SELECT {ts} FROM {table} WHERE rowid=?", (lo,)).fetchone()
+                last = db.execute(f"SELECT {ts} FROM {table} WHERE rowid=?", (hi,)).fetchone()
+                if first and last:
+                    span = f"{str(first[0])[:10]} -> {str(last[0])[:10]}"
+            except sqlite3.Error:
+                pass
+        rows_out.append((hi * per_row, table, hi, per_row, span))
+    for est, table, n, per_row, span in sorted(rows_out, reverse=True):
+        print(f"  {table:<24} ~{n / 1e6:9.2f}M rows x {per_row:6.0f} B = ~{est / 1e9:7.2f} GB   {span}")
+    print("\nEstimates only (deleted rows and indexes not counted). Read-only.")
+
+
 def main() -> None:
     cfg = json.loads(Path("config.json").read_text(encoding="utf-8"))
     db = sqlite3.connect(f"file:{cfg['db_path']}?mode=ro", uri=True, timeout=60)
+    if "--size" in sys.argv:
+        size_report(db, Path(cfg["db_path"]).resolve())
+        return
     print("=== 1. IS THE COLLECTOR ALIVE? (each should be recent) ===")
     print("last order-book update :", age(db, "SELECT received_at FROM book_events WHERE id=(SELECT MAX(id) FROM book_events)"))
     print("last forecast download :", age(db, "SELECT fetched_at FROM forecast_batches WHERE id=(SELECT MAX(id) FROM forecast_batches)"))

@@ -799,11 +799,18 @@ async def collect(
     last_forecast = 0.0
     last_observation = 0.0
     last_prepare = 0.0
+    last_prune = 0.0
+    prune_task = None
     try:
         while True:
             # 1. Discover active Polymarket weather markets/tokens.
             token_map = await scan(db, cfg)
             tokens = set(token_map)
+            # Only stream prices for sides we trade (NO-only halves storage).
+            allowed = _traded_sides(cfg)
+            if tokens and allowed != {"YES", "NO"}:
+                sides = dict(db.execute("SELECT token_id,side FROM tokens").fetchall())
+                tokens = {t for t in tokens if str(sides.get(t, "")).upper() in allowed}
             if not tokens:
                 LOG.warning(
                     "No tokens found; check Gamma connectivity or add event_slugs"
@@ -868,6 +875,17 @@ async def collect(
                         LOG.warning("AUTO PREP task failed: %s", exc)
                 prep_task = asyncio.create_task(run_auto_prepare(cfg))
                 last_prepare = time.monotonic()
+            # 6. Delete old price history / decision detail in a background thread.
+            now = time.monotonic()
+            if (cfg.get("_db_path") and (prune_task is None or prune_task.done())
+                    and now - last_prune >= float(cfg.get("prune_interval_hours", 6)) * 3600):
+                if prune_task is not None:
+                    try:
+                        LOG.info("PRUNE done | deleted %s", prune_task.result())
+                    except Exception as exc:
+                        LOG.warning("PRUNE failed: %s", exc)
+                prune_task = asyncio.create_task(asyncio.to_thread(prune_db, cfg["_db_path"], cfg))
+                last_prune = time.monotonic()
             # Short test mode. Runtime starts after initial refreshes.
             if seconds is not None:
                 LOG.info(
@@ -881,6 +899,9 @@ async def collect(
                 cfg["scan_interval_seconds"]
             )
     finally:
+        if prune_task and not prune_task.done():
+            LOG.info("Waiting for database cleanup to finish ...")
+            await asyncio.gather(prune_task, return_exceptions=True)
         if prep_task:
             prep_task.cancel()
             await asyncio.gather(prep_task, return_exceptions=True)
@@ -888,6 +909,188 @@ async def collect(
             task.cancel()
         if ws_tasks:
             await asyncio.gather(*ws_tasks, return_exceptions=True)
+# ---------------------------------------------------------------------------
+# Storage limits. Price history (book_events) and per-bracket decision detail grow
+# by ~10 GB/day if kept forever; the bot only needs the last few hours of prices.
+# Config: keep_book_hours (12), keep_decision_days (7), prune_interval_hours (6).
+# Never touched: bets, forecasts, observations, markets, results.
+# ---------------------------------------------------------------------------
+def _first_id_at_or_after(db: sqlite3.Connection, table: str, ts_col: str, cutoff: str) -> int | None:
+    """Ids grow with time, so binary-search the first id whose timestamp >= cutoff.
+    Returns None if the table is empty; MAX(id)+1 if every row is older."""
+    lo = db.execute(f"SELECT MIN(id) FROM {table}").fetchone()[0]
+    hi = db.execute(f"SELECT MAX(id) FROM {table}").fetchone()[0]
+    if lo is None:
+        return None
+    if str(db.execute(f"SELECT {ts_col} FROM {table} WHERE id=?", (hi,)).fetchone()[0]) < cutoff:
+        return hi + 1
+
+    def first_from(i: int) -> tuple[int, str]:
+        row = db.execute(f"SELECT id,{ts_col} FROM {table} WHERE id>=? ORDER BY id LIMIT 1", (i,)).fetchone()
+        return int(row[0]), str(row[1])
+
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if first_from(mid)[1] >= cutoff:
+            hi = mid
+        else:
+            lo = mid + 1
+    return first_from(lo)[0]
+
+
+def _book_keep_plan(db: sqlite3.Connection, keep_hours: float,
+                    sides: set[str] | None = None) -> tuple[str, int | None, dict[str, str]]:
+    """Cutoff for price history, plus active tokens whose latest full snapshot is older
+    than the cutoff (we must keep that snapshot and everything after it, because the
+    current price is rebuilt from the last snapshot + later updates)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=keep_hours)).isoformat()
+    cut_id = _first_id_at_or_after(db, "book_events", "received_at", cutoff)
+    lookback = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()  # bounds the search
+    protect: dict[str, str] = {}
+    for token, side in db.execute(
+            "SELECT t.token_id,t.side FROM tokens t JOIN markets m ON m.id=t.market_id WHERE m.active=1").fetchall():
+        if sides and str(side).upper() not in sides:
+            continue
+        row = db.execute(
+            """SELECT received_at FROM book_events WHERE token_id=? AND event_type='book'
+                 AND received_at>=? ORDER BY received_at DESC LIMIT 1""", (token, lookback)).fetchone()
+        if row and str(row[0]) < cutoff:
+            protect[str(token)] = str(row[0])
+    return cutoff, cut_id, protect
+
+
+def _table_exists(db: sqlite3.Connection, name: str, schema: str = "main") -> bool:
+    return db.execute(f"SELECT 1 FROM {schema}.sqlite_master WHERE type='table' AND name=?",
+                      (name,)).fetchone() is not None
+
+
+def _traded_sides(cfg: dict) -> set[str]:
+    return {str(s).upper() for s in cfg.get("decision", {}).get("allowed_sides", ("YES", "NO"))}
+
+
+def prune_db(db_path: str, cfg: dict) -> dict:
+    """Delete old price history and old decision detail in small batches (safe while
+    live.py runs). Freed space is reused by SQLite, so the file stops growing."""
+    db = sqlite3.connect(db_path, timeout=60)
+    db.execute("PRAGMA busy_timeout=60000")
+    out = {"book_events": 0, "live_decisions": 0, "live_model_diagnostics": 0, "live_decision_runs": 0}
+    try:
+        _, cut_id, protect = _book_keep_plan(db, float(cfg.get("keep_book_hours", 12)), _traded_sides(cfg))
+        if cut_id is not None:
+            db.execute("CREATE TEMP TABLE IF NOT EXISTS keep_tokens(token_id TEXT PRIMARY KEY)")
+            db.execute("DELETE FROM temp.keep_tokens")
+            db.executemany("INSERT INTO temp.keep_tokens VALUES (?)", [(t,) for t in protect])
+            start = db.execute("SELECT MIN(id) FROM book_events").fetchone()[0] or cut_id
+            while start < cut_id:
+                end = min(start + 20000, cut_id)
+                out["book_events"] += db.execute(
+                    """DELETE FROM book_events WHERE id>=? AND id<?
+                       AND (token_id IS NULL OR token_id NOT IN (SELECT token_id FROM temp.keep_tokens))""",
+                    (start, end)).rowcount
+                db.commit()
+                start = end
+            for token, snapshot_at in protect.items():
+                out["book_events"] += db.execute(
+                    "DELETE FROM book_events WHERE token_id=? AND received_at<?", (token, snapshot_at)).rowcount
+                db.commit()
+        if _table_exists(db, "live_decision_runs"):
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=float(cfg.get("keep_decision_days", 7)))).isoformat()
+            run_cut = _first_id_at_or_after(db, "live_decision_runs", "as_of", cutoff)
+            if run_cut is not None:
+                for table in ("live_decisions", "live_model_diagnostics"):
+                    if not _table_exists(db, table):
+                        continue
+                    while True:
+                        n = db.execute(f"""DELETE FROM {table} WHERE rowid IN (
+                            SELECT rowid FROM {table} WHERE run_id<? LIMIT 20000)""", (run_cut,)).rowcount
+                        db.commit()
+                        out[table] += n
+                        if n == 0:
+                            break
+                keep_audit = (" AND id NOT IN (SELECT run_id FROM paper_candidate_audit)"
+                              if _table_exists(db, "paper_candidate_audit") else "")
+                out["live_decision_runs"] = db.execute(
+                    f"DELETE FROM live_decision_runs WHERE id<?{keep_audit}", (run_cut,)).rowcount
+                db.commit()
+    finally:
+        db.close()
+    return out
+
+
+def compact_db(db_path: Path, cfg: dict) -> None:
+    """One-time rebuild into a small new file (run with collector.py and live.py STOPPED).
+
+    Copies everything except old price history / old decision detail, then swaps files:
+    the old database is kept as weather.old.sqlite3 until you delete it.
+    """
+    import shutil
+    new_path = db_path.with_name(db_path.stem + ".compact" + db_path.suffix)
+    old_backup = db_path.with_name(db_path.stem + ".old" + db_path.suffix)
+    if old_backup.exists():
+        raise SystemExit(f"{old_backup.name} already exists; delete it first (it is a previous copy).")
+    free_gb = shutil.disk_usage(db_path.parent).free / 1e9
+    print(f"Free disk space: {free_gb:.1f} GB")
+    if free_gb < 15:
+        raise SystemExit("Need at least ~15 GB free. Delete the old backup databases first.")
+    keep_hours = float(cfg.get("keep_book_hours", 12))
+    keep_days = float(cfg.get("keep_decision_days", 7))
+
+    src = sqlite3.connect(db_path, timeout=5)
+    busy, _, _ = src.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    if busy:
+        src.close()
+        raise SystemExit("Database is in use. Stop collector.py and live.py first, then retry.")
+    print("Finding what to keep ...", flush=True)
+    _, cut_id, protect = _book_keep_plan(src, keep_hours, _traded_sides(cfg))
+    run_cut = None
+    if _table_exists(src, "live_decision_runs"):
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=keep_days)).isoformat()
+        run_cut = _first_id_at_or_after(src, "live_decision_runs", "as_of", cutoff)
+    src.close()
+
+    if new_path.exists():
+        new_path.unlink()
+    dst = sqlite3.connect(new_path)
+    dst.execute("PRAGMA journal_mode=OFF")
+    dst.execute("PRAGMA synchronous=OFF")
+    dst.execute("ATTACH DATABASE ? AS o", (str(db_path),))
+    tables = dst.execute("""SELECT name,sql FROM o.sqlite_master
+                            WHERE type='table' AND name NOT LIKE 'sqlite_%'""").fetchall()
+    for name, sql in tables:
+        dst.execute(sql)
+        started = time.monotonic()
+        print(f"  copying {name} ...", end=" ", flush=True)
+        if name == "book_events" and cut_id is not None:
+            dst.execute("INSERT INTO main.book_events SELECT * FROM o.book_events WHERE id>=?", (cut_id,))
+            for token, snapshot_at in protect.items():
+                dst.execute("""INSERT INTO main.book_events SELECT * FROM o.book_events
+                               WHERE token_id=? AND received_at>=? AND id<?""", (token, snapshot_at, cut_id))
+        elif name in ("live_decisions", "live_model_diagnostics") and run_cut is not None:
+            dst.execute(f'INSERT INTO main."{name}" SELECT * FROM o."{name}" WHERE run_id>=?', (run_cut,))
+        else:
+            dst.execute(f'INSERT INTO main."{name}" SELECT * FROM o."{name}"')
+        dst.commit()
+        rows = dst.execute(f'SELECT count(*) FROM main."{name}"').fetchone()[0]
+        print(f"{rows:,} rows in {time.monotonic() - started:.0f}s", flush=True)
+    print("  rebuilding indexes ...", flush=True)
+    for (sql,) in dst.execute("SELECT sql FROM o.sqlite_master WHERE type='index' AND sql IS NOT NULL").fetchall():
+        dst.execute(sql)
+    dst.commit()
+    dst.execute("DETACH DATABASE o")
+    dst.execute("PRAGMA journal_mode=WAL")
+    dst.close()
+
+    for suffix in ("-wal", "-shm"):
+        extra = Path(str(db_path) + suffix)
+        if extra.exists():
+            extra.unlink()
+    db_path.rename(old_backup)
+    new_path.rename(db_path)
+    print(f"\nDone. New {db_path.name}: {db_path.stat().st_size / 1e9:.2f} GB")
+    print(f"Old database kept as {old_backup.name} ({old_backup.stat().st_size / 1e9:.1f} GB).")
+    print("Start collector.py + live.py, check 'python paper.py status', then delete the old file.")
+
+
 def import_observations(db: sqlite3.Connection, path: str) -> None:
     with open(path, newline="", encoding="utf-8-sig") as file:
         rows = list(csv.DictReader(file))
@@ -907,7 +1110,7 @@ def import_observations(db: sqlite3.Connection, path: str) -> None:
     print(f"Imported {len(rows)} observations")
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("collect", "status", "import-observations"))
+    parser.add_argument("command", choices=("collect", "status", "import-observations", "compact"))
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--seconds", type=float)
     parser.add_argument("--once", action="store_true")
@@ -923,6 +1126,10 @@ def main() -> None:
     db_path = Path(cfg["db_path"])
     if not db_path.is_absolute():
         db_path = config_path.parent / db_path
+    cfg["_db_path"] = str(db_path)
+    if args.command == "compact":
+        compact_db(db_path, cfg)
+        return
     db = db_open(str(db_path))
     try:
         if args.command == "status":

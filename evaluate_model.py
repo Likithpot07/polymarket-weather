@@ -82,8 +82,9 @@ def snapshot_near(db: sqlite3.Connection, event_id: str, moment: datetime,
                   max_gap_minutes: int) -> tuple[int, str] | None:
     lower = (moment - timedelta(minutes=max_gap_minutes)).isoformat()
     return db.execute(
-        """SELECT id,as_of FROM live_decision_runs
+        """SELECT id,as_of FROM live_decision_runs r
            WHERE event_id=? AND as_of<=? AND as_of>=?
+             AND EXISTS (SELECT 1 FROM live_model_diagnostics d WHERE d.run_id=r.id)
            ORDER BY as_of DESC LIMIT 1""",
         (event_id, moment.isoformat(), lower),
     ).fetchone()

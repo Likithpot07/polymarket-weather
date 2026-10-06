@@ -11,12 +11,15 @@ import time
 
 import os
 import re
+import subprocess
+import sys
+import threading
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from decide import event_decisions
 from filters import Policy
-from paper import PAPER_DDL, best_no_trade, city_day_gate, locked_candidates, process_pending_orders, schedule_order, settle_positions, stats as paper_stats
+from paper import PAPER_DDL, tag_legacy_orders, best_no_trade, city_day_gate, locked_candidates, process_pending_orders, schedule_order, settle_positions, stats as paper_stats
 
 LIVE_DDL = """
 CREATE TABLE IF NOT EXISTS live_decision_runs (
@@ -137,13 +140,21 @@ def active_event_ids(db: sqlite3.Connection, as_of: datetime) -> list[str]:
     return result
 
 
+_LAST_FULL_STORE: dict[str, datetime] = {}  # event_id -> last time full detail was saved
+
+
 def persist_snapshot(
     db: sqlite3.Connection,
     state: dict,
     decisions: list[dict],
     as_of: datetime,
+    store_full: bool = True,
 ) -> list[dict]:
-    """Persist one evaluation and return only newly-entered TRADE signals."""
+    """Persist one evaluation and return only newly-entered TRADE signals.
+
+    store_full=False skips the bulky per-bracket rows (live_decisions, diagnostics);
+    signal state and paper trades are always kept. Keeps the database small.
+    """
     counts = dict(Counter(d["action"] for d in decisions))
     cursor = db.execute(
         """INSERT INTO live_decision_runs(
@@ -159,7 +170,8 @@ def persist_snapshot(
         ),
     )
     run_id = cursor.lastrowid
-    db.execute(
+    if store_full:
+        db.execute(
         """INSERT INTO live_model_diagnostics(
                run_id,event_id,as_of,model_version,diagnostics_json
            ) VALUES (?,?,?,?,?)""",
@@ -185,7 +197,8 @@ def persist_snapshot(
     new_trades: list[dict] = []
 
     for decision in decisions:
-        db.execute(
+        if store_full:
+            db.execute(
             """INSERT INTO live_decisions(
                    run_id,market_id,side,action,model_probability,best_bid,best_ask,
                    ask_size,book_age_seconds,quote_source,depth_verified,entry_cost,
@@ -389,6 +402,79 @@ def telegram(text: str) -> None:
         print(f"TELEGRAM FAILED | {re.sub(r'bot[0-9]+:[A-Za-z0-9_-]+', 'bot***', str(exc))}", flush=True)
 
 
+# --- Telegram commands: reply to /status, /open, /today, /why from YOUR chat only ---
+# Fixed list of read-only scripts; nothing typed in Telegram is ever run as a command.
+TELEGRAM_COMMANDS = {
+    "/status": ["paper.py", "status"],
+    "/open": ["open_bets.py"],
+    "/today": ["open_bets.py", "--today"],
+    "/why": ["why_no_trades.py"],
+}
+TELEGRAM_HELP = "Commands:\n/status - paper P&L\n/open - all open bets\n/today - bets settling today\n/why - health check"
+
+
+def telegram_api(method: str, params: dict, timeout: float = 35) -> dict:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    data = urlencode(params).encode()
+    with urlopen(Request(f"https://api.telegram.org/bot{token}/{method}", data=data), timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def run_script(args: list[str], workdir: Path) -> str:
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    try:
+        out = subprocess.run(
+            [sys.executable, *args], cwd=workdir, env=env, capture_output=True,
+            timeout=120, text=True, encoding="utf-8", errors="replace",
+        )
+        text = (out.stdout or "") + (("\n" + out.stderr[-1500:]) if out.returncode else "")
+    except subprocess.TimeoutExpired:
+        text = "Timed out after 120s."
+    return text.strip() or "(no output)"
+
+
+def telegram_long(text: str) -> None:
+    """Telegram caps messages at 4096 chars, so send long output in pieces."""
+    for start in range(0, len(text), 3900):
+        telegram(text[start:start + 3900])
+
+
+def telegram_command_loop(workdir: Path) -> None:
+    """Background thread: long-polls Telegram and answers commands. Never crashes the bot."""
+    chat = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    offset = None
+    try:  # skip messages sent while the bot was off
+        old = telegram_api("getUpdates", {"offset": -1, "timeout": 0}).get("result", [])
+        if old:
+            offset = old[-1]["update_id"] + 1
+    except Exception:
+        pass
+    while True:
+        try:
+            params = {"timeout": 30, "allowed_updates": '["message"]'}
+            if offset is not None:
+                params["offset"] = offset
+            for update in telegram_api("getUpdates", params).get("result", []):
+                offset = update["update_id"] + 1
+                msg = update.get("message") or {}
+                if str(msg.get("chat", {}).get("id")) != chat:
+                    continue  # ignore anyone who isn't you
+                word = (msg.get("text") or "").strip().split(" ")[0].split("@")[0].lower()
+                if word in TELEGRAM_COMMANDS:
+                    telegram(f"Running {word} ...")
+                    telegram_long(run_script(TELEGRAM_COMMANDS[word], workdir))
+                elif word.startswith("/"):
+                    telegram(TELEGRAM_HELP)
+        except Exception as exc:
+            print(f"TELEGRAM POLL FAILED | {re.sub(r'bot[0-9]+:[A-Za-z0-9_-]+', 'bot***', str(exc))}", flush=True)
+            time.sleep(15)
+
+
+def start_telegram_commands(workdir: Path) -> None:
+    if os.environ.get("TELEGRAM_BOT_TOKEN") and os.environ.get("TELEGRAM_CHAT_ID"):
+        threading.Thread(target=telegram_command_loop, args=(workdir,), daemon=True).start()
+
+
 def short_question(text: str | None) -> str:
     m = re.search(r"in (.+?) be (.+?)(?: on |\?|$)", text or "")
     return f"{m.group(1)}: {m.group(2)}" if m else (text or "")[:60]
@@ -412,8 +498,16 @@ def run_cycle(
             counts = Counter(d["action"] for d in decisions)
             scheduled_trade = None
             gate_reason = None
+            every = float(cfg.get("decision_store_minutes", 0))
+            last_full = _LAST_FULL_STORE.get(event_id)
+            store_full = (every <= 0 or last_full is None
+                          or any(d["action"] == "TRADE" for d in decisions)
+                          or (evaluation_time - last_full).total_seconds() >= every * 60)
             with db:
-                new_trades = persist_snapshot(db, state, decisions, evaluation_time)
+                new_trades = persist_snapshot(db, state, decisions, evaluation_time,
+                                              store_full=store_full)
+                if store_full:
+                    _LAST_FULL_STORE[event_id] = evaluation_time
                 locked = locked_candidates(db, state["event_id"], decisions)
                 if locked:
                     # Locked brackets can't win; each is its own trade, so skip the city-day limit.
@@ -529,7 +623,7 @@ def run_cycle(
                  f"NO on {short_question(row[0] if row else '')}")
     if settled:
         st = paper_stats(db)
-        telegram(f"📊 All-time paper P&L: {st['realized_pnl']:+.2f} USD | "
+        telegram(f"📊 New bot paper P&L: {st['realized_pnl']:+.2f} USD | "
                  f"{st['wins']} wins / {st['losses']} losses")
     summary["paper"] = paper_stats(db)
     return summary
@@ -545,7 +639,7 @@ def main() -> None:
 
     config_path = Path(args.config).resolve()
     load_env(config_path.parent / ".env")
-    telegram("🤖 Weather bot (live.py) started - paper mode")
+    telegram("🤖 Weather bot (live.py) started - paper mode\nSend /help for commands")
     cfg = json.loads(config_path.read_text(encoding="utf-8"))
     db_path = Path(cfg["db_path"])
     if not db_path.is_absolute():
@@ -565,6 +659,10 @@ def main() -> None:
     db.execute("PRAGMA busy_timeout=5000")
     db.executescript(LIVE_DDL)
     db.executescript(PAPER_DDL)
+    tag_legacy_orders(db)
+
+    if not args.once:
+        start_telegram_commands(config_path.parent)
 
     print(
         "LIVE PAPER SIGNALS | no orders are placed | "
