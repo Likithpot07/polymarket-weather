@@ -4,6 +4,8 @@ Read-only against your collector DB except for a small cache table of settled
 outcomes (event_outcomes). Run it from the repo folder:
 
     python evaluate_model.py --max-events 120
+    python evaluate_model.py --lock-speed       # how cheap were locked NOs when we first saw the lock?
+    python evaluate_model.py --run-speed        # does the market lag behind new forecast runs?
 
 Paste the printed report back to Claude. It also writes data/eval_snapshots.csv.
 
@@ -26,6 +28,7 @@ import csv
 from datetime import date, datetime, time, timedelta, timezone
 import json
 import math
+import re
 from pathlib import Path
 import sqlite3
 from zoneinfo import ZoneInfo
@@ -136,6 +139,223 @@ def fmt(values: list[float]) -> str:
     return f"{sum(values) / len(values):.4f}" if values else "   n/a"
 
 
+def run_speed(db: sqlite3.Connection, days: int, models: list[str], jump_c: float = 1.0) -> None:
+    """When a weather model's forecast for a day 1-3 days out jumps by >= jump_c,
+    does the market's implied temperature move BEFORE our bot downloaded the new run
+    (market faster: no edge from speed) or AFTER (market slow: a fast bot could win)?
+    Market implied temperature = probability-weighted bracket middle, from live.py's
+    saved NO prices (last ~7 days)."""
+    from zoneinfo import ZoneInfo
+    from probability import bracket as parse_bracket, parse_time
+
+    now = datetime.now(timezone.utc)
+    lo_day = (now.date() - timedelta(days=days)).isoformat()
+    events = db.execute(
+        """SELECT DISTINCT m.event_id,m.city,m.target_date,l.timezone FROM markets m
+           JOIN locations l ON l.city=m.city WHERE m.target_date>=? ORDER BY m.target_date""",
+        (lo_day,)).fetchall()
+
+    def implied_mean(event_id, centers, moment):
+        run = db.execute(
+            """SELECT r.id FROM live_decision_runs r WHERE r.event_id=? AND r.as_of<=?
+                 AND EXISTS (SELECT 1 FROM live_model_diagnostics d WHERE d.run_id=r.id)
+               ORDER BY r.as_of DESC LIMIT 1""", (event_id, moment.isoformat())).fetchone()
+        if not run:
+            return None
+        weights = total = 0.0
+        for market_id, bid, ask in db.execute(
+                "SELECT market_id,best_bid,best_ask FROM live_decisions WHERE run_id=? AND side='NO'", (run[0],)):
+            if market_id not in centers or bid is None or ask is None:
+                continue
+            p_yes = 1 - (float(bid) + float(ask)) / 2
+            weights += max(p_yes, 0.0)
+            total += max(p_yes, 0.0) * centers[market_id]
+        return total / weights if weights > 0.5 else None
+
+    jumps = []
+    for event_id, city, target, tz_name in events:
+        tz = ZoneInfo(tz_name)
+        centers, unit = {}, None
+        for market_id, question in db.execute("SELECT id,question FROM markets WHERE event_id=?", (event_id,)):
+            parsed = parse_bracket(question or "")
+            if not parsed:
+                continue
+            lo, hi, unit = parsed
+            centers[str(market_id)] = ((lo + hi) / 2 if lo is not None and hi is not None
+                                       else (hi - 1 if lo is None else lo + 1))
+        if len(centers) < 3:
+            continue
+        to_unit = (lambda c: c) if unit == "C" else (lambda c: c * 9 / 5 + 32)
+        last_hour = None
+        for model in models:
+            prev = None
+            for fetched, value in db.execute(
+                    """SELECT b.fetched_at,v.temperature_c FROM forecast_batches b
+                       JOIN forecast_values v ON v.batch_id=b.id
+                       WHERE b.city=? AND b.model=? AND v.period='daily_max' AND v.valid_time=?
+                       ORDER BY b.fetched_at""", (city, model, target)):
+                moment = parse_time(str(fetched))
+                lead = (date.fromisoformat(target) - moment.astimezone(tz).date()).days
+                if prev is not None and 1 <= lead <= 3 and abs(float(value) - prev) >= jump_c:
+                    hour = (event_id, moment.replace(minute=0, second=0, microsecond=0))
+                    if hour != last_hour and moment <= now - timedelta(hours=3):
+                        last_hour = hour
+                        direction = 1 if float(value) > prev else -1
+                        marks = {k: implied_mean(event_id, centers, moment + timedelta(minutes=k))
+                                 for k in (-120, -30, 0, 30, 60, 180)}
+                        if all(v is not None for v in marks.values()):
+                            jumps.append({"city": city, "target": target, "model": model, "lead": lead,
+                                          "when": moment.astimezone(tz).strftime("%m-%d %H:%M"),
+                                          "jump": to_unit(float(value)) - to_unit(prev), "dir": direction,
+                                          "unit": unit, **marks})
+                prev = float(value)
+
+    print(f"=== RUN SPEED: forecast jumps >= {jump_c}C for days 1-3 ahead, last {days} days ===")
+    print(f"events checked: {len(events)} | forecast jumps with market prices around them: {len(jumps)}")
+    if not jumps:
+        print("Not enough saved prices around forecast jumps yet (live.py keeps ~7 days).")
+        return
+    print("\nMarket's implied temperature around each jump (0 = when our bot downloaded the new run)")
+    print(f"{'city':<13}{'target':<11}{'model':<14}{'jump':>6}  {'-2h':>6} {'-30m':>6} {'0':>6} {'+30m':>6} {'+1h':>6} {'+3h':>6}")
+    for j in sorted(jumps, key=lambda x: -abs(x["jump"]))[:25]:
+        print(f"{j['city'][:12]:<13}{j['target']:<11}{j['model'][:13]:<14}{j['jump']:>+5.1f}{j['unit']} "
+              + " ".join(f"{j[k]:>6.1f}" for k in (-120, -30, 0, 30, 60, 180)))
+    def moved(j, a, b):  # market move in the direction of the forecast jump
+        return (j[b] - j[a]) * j["dir"]
+    n = len(jumps)
+    before = sum(moved(j, -120, 0) for j in jumps) / n
+    after1 = sum(moved(j, 0, 60) for j in jumps) / n
+    after3 = sum(moved(j, 0, 180) for j in jumps) / n
+    print(f"\nAverage market move in the jump's direction ({jumps[0]['unit']} mix; positive = same way as forecast):")
+    print(f"  2h before -> our download : {before:+.2f}")
+    print(f"  our download -> +1h       : {after1:+.2f}")
+    print(f"  our download -> +3h       : {after3:+.2f}")
+    b, a = max(before, 0.0), max(after3, 0.0)
+    share = b / (b + a) if (b + a) > 0 else None
+    if share is not None:
+        print(f"  share of the move that happened BEFORE our download: {share * 100:.0f}%")
+    print("\nHow to read: if most of the move is BEFORE our download, the market is faster than us"
+          "\nand speed alone won't help. A big move AFTER our download = a fast bot could catch it.")
+
+
+def lock_speed(db: sqlite3.Connection, days: int) -> None:
+    """For brackets the airport readings ruled out on the target day ("locked NO"):
+    what did the NO cost just before, at the moment our bot could first know, and
+    10/30/60 minutes later? Cheap prices at 'seen' = an opportunity speed could catch.
+    Uses the same lock rule as the live bot (2nd-highest reading >= top of bracket
+    + 0.5 + margin). Prices come from live.py's saved decisions (last ~7 days).
+    """
+    from zoneinfo import ZoneInfo
+    from probability import LOCK_MARGIN_C, bracket as parse_bracket, parse_time
+
+    since = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    today = datetime.now(timezone.utc).date().isoformat()
+    events = db.execute(
+        """SELECT DISTINCT m.event_id,m.city,m.target_date,l.timezone FROM markets m
+           JOIN locations l ON l.city=m.city
+           WHERE m.target_date>=? AND m.target_date<? ORDER BY m.target_date""",
+        (since, today)).fetchall()
+
+    def price_at(event_id, market_id, moment, before):
+        op, order = ("<=", "DESC") if before else (">=", "ASC")
+        row = db.execute(
+            f"""SELECT r.as_of,d.best_ask,d.best_bid FROM live_decision_runs r
+                JOIN live_decisions d ON d.run_id=r.id
+                WHERE r.event_id=? AND r.as_of{op}? AND d.market_id=? AND d.side='NO'
+                  AND d.best_ask IS NOT NULL
+                ORDER BY r.as_of {order} LIMIT 1""",
+            (event_id, moment.isoformat(), market_id)).fetchone()
+        return row
+
+    locks = []
+    for event_id, city, target, tz_name in events:
+        tz = ZoneInfo(tz_name)
+        brackets = db.execute(
+            """SELECT m.id,m.question,r.station,r.unit FROM markets m
+               LEFT JOIN rule_reviews r ON r.market_id=m.id WHERE m.event_id=?""", (event_id,)).fetchall()
+        station = next((b[2] for b in brackets if b[2]), None)
+        unit = next((b[3] for b in brackets if b[3]), None)
+        if not station or unit not in ("C", "F"):
+            continue
+        readings = []  # (fetched_at, observed_at, value in market unit), target local day only
+        seen_keys = set()
+        for observed, temp, stored_unit, fetched, rec in db.execute(
+                """SELECT o.observed_at,o.temperature,o.unit,o.fetched_at,o.source_record_id
+                   FROM observations o JOIN markets m ON o.market_id=m.id
+                   WHERE m.event_id=? AND o.station=? ORDER BY o.fetched_at""", (event_id, station)):
+            try:
+                moment = parse_time(str(observed))
+                if moment.astimezone(tz).date().isoformat() != target:
+                    continue
+                key = str(rec or moment.isoformat())
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                c = float(temp) if stored_unit == "C" else (float(temp) - 32) * 5 / 9
+                readings.append((parse_time(str(fetched)), moment, c if unit == "C" else c * 9 / 5 + 32))
+            except (TypeError, ValueError):
+                continue
+        if len(readings) < 2:
+            continue
+        margin = LOCK_MARGIN_C if unit == "C" else LOCK_MARGIN_C * 9 / 5
+        outcomes = dict(db.execute("SELECT market_id,yes_result FROM event_outcomes WHERE event_id=?", (event_id,)))
+        for market_id, question, _, _ in brackets:
+            parsed = parse_bracket(question or "")
+            if not parsed or parsed[1] is None:
+                continue
+            threshold = parsed[1] + 0.5 + margin
+            top2 = []
+            for fetched, observed, value in readings:  # in the order the bot learned them
+                top2 = sorted(top2 + [value], reverse=True)[:2]
+                if len(top2) == 2 and top2[1] >= threshold:
+                    before = price_at(event_id, market_id, observed, True)
+                    seen = price_at(event_id, market_id, fetched, False)
+                    later = {m: price_at(event_id, market_id, fetched + timedelta(minutes=m), False)
+                             for m in (10, 30, 60)}
+                    locks.append({
+                        "city": city, "target": target, "question": question,
+                        "local": fetched.astimezone(tz).strftime("%H:%M"),
+                        "lag_min": (fetched - observed).total_seconds() / 60,
+                        "before": before[1] if before else None,
+                        "seen": seen[1] if seen else None,
+                        "seen_delay_min": ((parse_time(seen[0]) - fetched).total_seconds() / 60) if seen else None,
+                        **{f"+{m}": (r[1] if r else None) for m, r in later.items()},
+                        "resolved_yes": outcomes.get(str(market_id)),
+                    })
+                    break
+
+    print(f"=== LOCK SPEED: brackets ruled out by airport readings, last {days} days ===")
+    print(f"events checked: {len(events)} | locked brackets found: {len(locks)}")
+    priced = [l for l in locks if l["seen"] is not None]
+    print(f"with a NO price saved right after the lock: {len(priced)}")
+    if not priced:
+        print("No saved prices around lock times (live.py keeps ~7 days). Try again later.")
+        return
+    f = lambda x: "  n/a" if x is None else f"{x:.3f}"
+    print("\nNO price (ask) per locked bracket. 'seen' = first price after our bot got the reading.")
+    print(f"{'city':<14}{'date':<11}{'time':>6}{'lag':>5}  {'before':>6} {'seen':>6} {'+10m':>6} {'+30m':>6} {'+60m':>6}  bracket")
+    for l in sorted(priced, key=lambda x: x["seen"])[:40]:
+        b = re.search(r"be (.+?)(?: on |\?|$)", l["question"] or "")
+        print(f"{l['city'][:13]:<14}{l['target']:<11}{l['local']:>6}{l['lag_min']:>4.0f}m  "
+              f"{f(l['before']):>6} {f(l['seen']):>6} {f(l['+10']):>6} {f(l['+30']):>6} {f(l['+60']):>6}  "
+              f"{(b.group(1) if b else '')[:22]}{'  <-- RESOLVED YES!' if l['resolved_yes'] == 1 else ''}")
+    print("\nHow cheap was the NO at the moment we could first know?")
+    for lo, hi in [(0, 0.5), (0.5, 0.8), (0.8, 0.95), (0.95, 0.99), (0.99, 1.01)]:
+        g = [l for l in priced if lo <= l["seen"] < hi]
+        if g:
+            gain = sum((1 - l["seen"]) / l["seen"] for l in g) / len(g) * 100
+            print(f"  ask {lo:.2f}-{min(hi, 1):.2f}: {len(g):>3} locks | avg profit if bought: {gain:5.1f}% per bet")
+    cheap = [l for l in priced if l["seen"] < 0.9]
+    for m in (10, 30, 60):
+        still = [l for l in cheap if l[f"+{m}"] is not None and l[f"+{m}"] < 0.9]
+        print(f"  of {len(cheap)} locks priced under 0.90 when seen, still under 0.90 after {m} min: {len(still)}")
+    lags = sorted(l["lag_min"] for l in priced)
+    print(f"\nReading delay (airport time -> our bot had it): median {lags[len(lags)//2]:.0f} min, "
+          f"worst {lags[-1]:.0f} min")
+    bad = [l for l in locks if l["resolved_yes"] == 1]
+    print(f"Safety: {len(bad)} locked brackets resolved YES (must be 0)")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default="config.json")
@@ -143,6 +363,11 @@ def main() -> None:
     ap.add_argument("--max-gap-minutes", type=int, default=45)
     ap.add_argument("--offline", action="store_true", help="Only use cached/paper outcomes")
     ap.add_argument("--out", default="data/eval_snapshots.csv")
+    ap.add_argument("--lock-speed", action="store_true",
+                    help="Only run the locked-NO price/speed study and exit")
+    ap.add_argument("--run-speed", action="store_true",
+                    help="Only run the new-forecast-run market speed study and exit")
+    ap.add_argument("--days", type=int, default=7, help="Days back for --lock-speed / --run-speed")
     args = ap.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -152,6 +377,12 @@ def main() -> None:
     db = sqlite3.connect(db_path, timeout=30)
     db.execute("PRAGMA busy_timeout=60000")
     db.executescript(OUTCOME_DDL)
+    if args.lock_speed:
+        lock_speed(db, args.days)
+        return
+    if args.run_speed:
+        run_speed(db, args.days, cfg.get("weather_models", ["ecmwf_ifs025", "gfs_global", "icon_global"]))
+        return
     min_days = int(cfg.get("decision", {}).get("min_calibration_days", 14))
 
     today = datetime.now(timezone.utc).date()

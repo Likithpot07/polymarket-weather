@@ -42,13 +42,18 @@ def size_report(db, db_path: Path) -> None:
         print(f"  {f.name:<32} {f.stat().st_size / 1e9:8.2f} GB")
     print("\n=== TABLES (estimated, biggest first) ===")
     rows_out = []
+    import time
     for table, ts in SIZE_TABLES.items():
+        started = time.monotonic()
+        print(f"  checking {table} ...", end=" ", flush=True)
         try:
             hi = db.execute(f"SELECT MAX(rowid) FROM {table}").fetchone()[0]  # separate queries:
             lo = db.execute(f"SELECT MIN(rowid) FROM {table}").fetchone()[0]  # each is instant
         except sqlite3.Error:
+            print("skipped (no such table)", flush=True)
             continue
         if hi is None:
+            print("empty", flush=True)
             continue
         sample = db.execute(f"SELECT * FROM {table} WHERE rowid>?", (hi - 2000,)).fetchall()
         per_row = sum(sum(len(str(v)) for v in r if v is not None) for r in sample) / max(1, len(sample))
@@ -62,6 +67,7 @@ def size_report(db, db_path: Path) -> None:
             except sqlite3.Error:
                 pass
         rows_out.append((hi * per_row, table, hi, per_row, span))
+        print(f"done in {time.monotonic() - started:.1f}s", flush=True)
     for est, table, n, per_row, span in sorted(rows_out, reverse=True):
         print(f"  {table:<24} ~{n / 1e6:9.2f}M rows x {per_row:6.0f} B = ~{est / 1e9:7.2f} GB   {span}")
     print("\nEstimates only (deleted rows and indexes not counted). Read-only.")
@@ -75,7 +81,9 @@ def main() -> None:
         return
     print("=== 1. IS THE COLLECTOR ALIVE? (each should be recent) ===")
     print("last order-book update :", age(db, "SELECT received_at FROM book_events WHERE id=(SELECT MAX(id) FROM book_events)"))
-    print("last forecast download :", age(db, "SELECT fetched_at FROM forecast_batches WHERE id=(SELECT MAX(id) FROM forecast_batches)"))
+    print("last forecast download :", age(db, "SELECT MAX(fetched_at) FROM forecast_batches WHERE id>(SELECT MAX(id)-5000 FROM forecast_batches) AND model NOT LIKE 'ens_%'"))
+    ens = age(db, "SELECT MAX(fetched_at) FROM forecast_batches WHERE id>(SELECT MAX(id)-5000 FROM forecast_batches) AND model LIKE 'ens_%'")
+    print("last ensemble download :", ens.replace("  <-- STALE", "") + "  (every 6h; data collection only)")
     print("last temperature read  :", age(db, "SELECT fetched_at FROM observations WHERE id=(SELECT MAX(id) FROM observations)"))
     print("last live.py decision  :", age(db, "SELECT as_of FROM live_decision_runs WHERE id=(SELECT MAX(id) FROM live_decision_runs)"))
 

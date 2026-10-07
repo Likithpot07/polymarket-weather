@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     settled_at TEXT,
     settlement_source TEXT,
     last_error TEXT,
+    legacy INTEGER NOT NULL DEFAULT 0,
     UNIQUE(event_id,market_id,side,signal_at)
 );
 CREATE INDEX IF NOT EXISTS paper_order_status_time

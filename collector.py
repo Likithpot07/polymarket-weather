@@ -49,6 +49,7 @@ def _cloudflare_app_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
 socket.getaddrinfo = _cloudflare_app_getaddrinfo
 GAMMA = "https://gamma-api.polymarket.com"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_ENSEMBLE = "https://ensemble-api.open-meteo.com/v1/ensemble"
 GEOCODE = "https://geocoding-api.open-meteo.com/v1/search"
 WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 AVIATION_WEATHER = "https://aviationweather.gov/api/data/metar"
@@ -501,6 +502,73 @@ async def collect_forecasts(db: sqlite3.Connection, cfg: dict) -> None:
             await collect_nws(db, city, latitude, longitude, loc["timezone"])
 
 
+def ensemble_daily_highs(payload: dict) -> dict[str, dict[str, float]]:
+    """{member: {local_date: daily max C}} from an Open-Meteo ensemble hourly payload
+    (times are already local because we request the city's timezone)."""
+    hourly = payload.get("hourly") or {}
+    times = hourly.get("time") or []
+    out: dict[str, dict[str, float]] = {}
+    for key, values in hourly.items():
+        if not key.startswith("temperature_2m") or not isinstance(values, list):
+            continue
+        member = "control" if key == "temperature_2m" else key.split("member", 1)[-1].split("_")[0]
+        days: dict[str, float] = {}
+        for stamp, value in zip(times, values):
+            if value is None:
+                continue
+            day = str(stamp)[:10]
+            days[day] = max(days.get(day, float(value)), float(value))
+        if days:
+            out[member] = days
+    return out
+
+
+async def collect_ensembles(db: sqlite3.Connection, cfg: dict) -> None:
+    """Ensemble forecasts (ECMWF 51 + GFS 31 members) at the settlement airport.
+
+    Saved for later analysis / ML only: model 'ens_<name>', period 'ens_member_<NN>',
+    one row per member per local day. The live betting model ignores them.
+    """
+    models = cfg.get("ensemble_models", ["ecmwf_ifs025", "gfs025"])
+    days = int(cfg.get("ensemble_days", 4))
+    cities = [row[0] for row in db.execute(
+        "SELECT DISTINCT city FROM markets WHERE city IS NOT NULL AND active=1")]
+    for city in cities:
+        try:
+            loc = await location_for(db, cfg, city)
+        except (HTTPError, URLError, ValueError):
+            continue
+        if not loc:
+            continue
+        latitude, longitude = loc["latitude"], loc["longitude"]
+        if cfg.get("forecast_at_station", True):
+            station = station_coordinates(db, city)
+            if station:
+                latitude, longitude, _ = station
+        for model in models:
+            params = dict(latitude=latitude, longitude=longitude, hourly="temperature_2m",
+                          models=model, timezone=loc["timezone"], forecast_days=days,
+                          temperature_unit="celsius")
+            url = f"{OPEN_METEO_ENSEMBLE}?{urlencode(params)}"
+            try:
+                payload = await fetch(url)
+                if not isinstance(payload, dict) or payload.get("error"):
+                    raise ValueError((payload or {}).get("reason", "API error"))
+                members = ensemble_daily_highs(payload)
+                if len(members) < 2:
+                    raise ValueError("no ensemble members in response")
+                with db:
+                    cursor = db.execute(
+                        "INSERT INTO forecast_batches(city,model,fetched_at,model_run_at,endpoint,raw_json) VALUES (?,?,?,NULL,?,?)",
+                        (city, f"ens_{model}", utc_now(), url, "{}"))
+                    db.executemany("INSERT INTO forecast_values VALUES (?,?,?,?)",
+                                   [(cursor.lastrowid, f"ens_member_{member}", day, value)
+                                    for member, by_day in members.items() for day, value in by_day.items()])
+                LOG.info("ENSEMBLE %s %s | %d members", city, model, len(members))
+            except (HTTPError, URLError, ValueError, KeyError, TypeError) as exc:
+                LOG.warning("Ensemble %s %s failed: %s", city, model, exc)
+
+
 NWS_POINTS = "https://api.weather.gov/points"
 _NWS_GRID: dict[str, str] = {}
 
@@ -797,6 +865,7 @@ async def collect(
     prep_task = None
     current: set[str] = set()
     last_forecast = 0.0
+    last_ensemble = 0.0
     last_observation = 0.0
     last_prepare = 0.0
     last_prune = 0.0
@@ -860,6 +929,12 @@ async def collect(
             ):
                 await collect_forecasts(db, cfg)
                 last_forecast = time.monotonic()
+            # 4b. Ensemble forecasts (data collection only; not used for betting yet).
+            now = time.monotonic()
+            if (cfg.get("collect_ensembles", True)
+                    and now - last_ensemble >= float(cfg.get("ensemble_interval_seconds", 21600))):
+                await collect_ensembles(db, cfg)
+                last_ensemble = time.monotonic()
             # 5. Verify rules + calibrate newly discovered events in a background process.
             now = time.monotonic()
             prepare_interval = float(cfg.get("prepare_interval_seconds", 900))
