@@ -51,6 +51,7 @@
     "min_forecast_lead_days": 2,
     "min_net_edge": 0.04,
     "min_forecast_distance_sigma": 1.0,
+    "skip_cities": ["Chicago"],
     "max_book_age_seconds": 10800
   },
   "dataset_cities": [

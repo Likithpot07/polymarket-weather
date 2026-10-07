@@ -72,9 +72,12 @@ def outcomes_for(db: sqlite3.Connection, event_id: str, offline: bool) -> dict[s
         if market_id in results and results[market_id] != value:
             print(f"  WARNING outcome mismatch event {event_id} market {market_id}")
     now = datetime.now(timezone.utc).isoformat()
-    with db:
-        db.executemany("INSERT OR REPLACE INTO event_outcomes VALUES (?,?,?,?)",
-                       [(event_id, m, y, now) for m, y in results.items()])
+    try:  # cache only; if the bot is busy writing, skip caching instead of crashing
+        with db:
+            db.executemany("INSERT OR REPLACE INTO event_outcomes VALUES (?,?,?,?)",
+                           [(event_id, m, y, now) for m, y in results.items()])
+    except sqlite3.OperationalError as exc:
+        print(f"  (outcome cache skipped for {event_id}: {exc})")
     return results
 
 
@@ -147,7 +150,7 @@ def main() -> None:
     db_path = Path(cfg["db_path"])
     db_path = db_path if db_path.is_absolute() else config_path.parent / db_path
     db = sqlite3.connect(db_path, timeout=30)
-    db.execute("PRAGMA busy_timeout=10000")
+    db.execute("PRAGMA busy_timeout=60000")
     db.executescript(OUTCOME_DDL)
     min_days = int(cfg.get("decision", {}).get("min_calibration_days", 14))
 

@@ -52,6 +52,8 @@ class Policy:
     # (typical forecast errors) outside the bracket. check_losse.py: bets under 1 sigma
     # lost 5 of 9 (-$30), bets at 1+ sigma lost 3 of 41 (+$96). 0 = off.
     min_forecast_distance_sigma: float = 0.0
+    # Cities never to bet on (any bet type), e.g. ["Chicago"]. Case-insensitive.
+    skip_cities: tuple[str, ...] = ()
 
     @classmethod
     def from_config(cls, cfg: dict) -> "Policy":
@@ -61,6 +63,8 @@ class Policy:
             raise ValueError(f"Unknown decision settings: {sorted(unknown)}")
         if "allowed_sides" in overrides:
             overrides = {**overrides, "allowed_sides": tuple(overrides["allowed_sides"])}
+        if "skip_cities" in overrides:
+            overrides = {**overrides, "skip_cities": tuple(overrides["skip_cities"])}
         policy = cls(**overrides)
         if not policy.allowed_sides or set(policy.allowed_sides) - {"YES", "NO"}:
             raise ValueError("allowed_sides must contain YES and/or NO")
@@ -122,6 +126,8 @@ def assess(state: dict, outcome: dict, side: str, quote: dict | None,
     hard, soft = [], []
     if side not in policy.allowed_sides:
         hard.append("SIDE_DISABLED")
+    if str(state.get("city", "")).lower() in {c.lower() for c in policy.skip_cities}:
+        hard.append("CITY_SKIPPED")
     if quote is None:
         hard.append("NO_RECENT_QUOTE")
     else:

@@ -884,6 +884,7 @@ async def collect(
                         LOG.info("PRUNE done | deleted %s", prune_task.result())
                     except Exception as exc:
                         LOG.warning("PRUNE failed: %s", exc)
+                LOG.info("PRUNE started (deletes old price history in the background)")
                 prune_task = asyncio.create_task(asyncio.to_thread(prune_db, cfg["_db_path"], cfg))
                 last_prune = time.monotonic()
             # Short test mode. Runtime starts after initial refreshes.
@@ -900,7 +901,8 @@ async def collect(
             )
     finally:
         if prune_task and not prune_task.done():
-            LOG.info("Waiting for database cleanup to finish ...")
+            _PRUNE_STOP.set()  # cleanup stops after its current small batch
+            LOG.info("Stopping database cleanup (resumes next start) ...")
             await asyncio.gather(prune_task, return_exceptions=True)
         if prep_task:
             prep_task.cancel()
@@ -964,6 +966,10 @@ def _table_exists(db: sqlite3.Connection, name: str, schema: str = "main") -> bo
                       (name,)).fetchone() is not None
 
 
+import threading
+_PRUNE_STOP = threading.Event()  # set on shutdown so Ctrl+C never waits for a long cleanup
+
+
 def _traded_sides(cfg: dict) -> set[str]:
     return {str(s).upper() for s in cfg.get("decision", {}).get("allowed_sides", ("YES", "NO"))}
 
@@ -981,8 +987,8 @@ def prune_db(db_path: str, cfg: dict) -> dict:
             db.execute("DELETE FROM temp.keep_tokens")
             db.executemany("INSERT INTO temp.keep_tokens VALUES (?)", [(t,) for t in protect])
             start = db.execute("SELECT MIN(id) FROM book_events").fetchone()[0] or cut_id
-            while start < cut_id:
-                end = min(start + 20000, cut_id)
+            while start < cut_id and not _PRUNE_STOP.is_set():
+                end = min(start + 5000, cut_id)  # small batches keep write locks short
                 out["book_events"] += db.execute(
                     """DELETE FROM book_events WHERE id>=? AND id<?
                        AND (token_id IS NULL OR token_id NOT IN (SELECT token_id FROM temp.keep_tokens))""",
@@ -990,6 +996,8 @@ def prune_db(db_path: str, cfg: dict) -> dict:
                 db.commit()
                 start = end
             for token, snapshot_at in protect.items():
+                if _PRUNE_STOP.is_set():
+                    break
                 out["book_events"] += db.execute(
                     "DELETE FROM book_events WHERE token_id=? AND received_at<?", (token, snapshot_at)).rowcount
                 db.commit()
@@ -1002,10 +1010,10 @@ def prune_db(db_path: str, cfg: dict) -> dict:
                         continue
                     while True:
                         n = db.execute(f"""DELETE FROM {table} WHERE rowid IN (
-                            SELECT rowid FROM {table} WHERE run_id<? LIMIT 20000)""", (run_cut,)).rowcount
+                            SELECT rowid FROM {table} WHERE run_id<? LIMIT 5000)""", (run_cut,)).rowcount
                         db.commit()
                         out[table] += n
-                        if n == 0:
+                        if n == 0 or _PRUNE_STOP.is_set():
                             break
                 keep_audit = (" AND id NOT IN (SELECT run_id FROM paper_candidate_audit)"
                               if _table_exists(db, "paper_candidate_audit") else "")
