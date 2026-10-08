@@ -389,14 +389,14 @@ def load_env(path: Path) -> None:
             os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
-def telegram(text: str) -> None:
+def telegram(text: str, timeout: float = 10) -> None:
     """Send a Telegram message if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set. Never crashes the bot."""
     token, chat = os.environ.get("TELEGRAM_BOT_TOKEN"), os.environ.get("TELEGRAM_CHAT_ID")
     if not token or not chat:
         return
     try:
         data = urlencode({"chat_id": chat, "text": text}).encode()
-        with urlopen(Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data), timeout=10) as r:
+        with urlopen(Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data), timeout=timeout) as r:
             r.read()
     except Exception as exc:  # network trouble must not stop trading
         print(f"TELEGRAM FAILED | {re.sub(r'bot[0-9]+:[A-Za-z0-9_-]+', 'bot***', str(exc))}", flush=True)
@@ -629,7 +629,50 @@ def run_cycle(
     return summary
 
 
+class _StopSignal(Exception):
+    """Raised when Windows/OS asks the bot to stop (window closed, shutdown, kill)."""
+
+
+def _install_stop_handlers() -> None:
+    import signal
+
+    def handler(signum, _frame):
+        raise _StopSignal(f"window closed or system stop (signal {signum})")
+    for name in ("SIGTERM", "SIGBREAK"):  # SIGBREAK = console window closed on Windows
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), handler)
+            except (ValueError, OSError):
+                pass
+
+
 def main() -> None:
+    """Runs the bot and always sends a Telegram message when it stops, whatever the reason."""
+    once = "--once" in sys.argv
+    reason = "stopped"
+    _install_stop_handlers()
+    try:
+        _main()
+        reason = "finished"
+    except KeyboardInterrupt:
+        reason = "stopped by you (Ctrl+C)"
+        print("Stopped.", flush=True)
+    except _StopSignal as exc:
+        reason = str(exc)
+    except SystemExit as exc:
+        reason = f"exited (code {exc.code})"
+        raise
+    except BaseException as exc:
+        detail = re.sub(r"bot[0-9]+:[A-Za-z0-9_-]+", "bot***", f"{type(exc).__name__}: {exc}")
+        reason = f"CRASHED - {detail}"[:300]
+        raise
+    finally:
+        if not once:
+            telegram(f"🛑 Weather bot (live.py) STOPPED - {reason}\n"
+                     "Open bets are safe; they settle once it runs again.", timeout=4)
+
+
+def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--event-id", action="append", help="Limit to event ID; repeatable")
@@ -688,8 +731,6 @@ def main() -> None:
                 break
             elapsed = time.monotonic() - cycle_started
             time.sleep(max(0.0, interval - elapsed))
-    except KeyboardInterrupt:
-        print("Stopped.", flush=True)
     finally:
         db.close()
 
