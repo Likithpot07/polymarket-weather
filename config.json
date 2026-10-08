@@ -56,6 +56,7 @@
     "min_forecast_distance_sigma": 1.0,
     "skip_cities": ["Chicago"],
     "max_model_spread_c": 0.6,
+    "shadow_rules": ["MODEL_DISAGREEMENT", "FORECAST_TOO_CLOSE_TO_BRACKET"],
     "max_book_age_seconds": 10800
   },
   "dataset_cities": [

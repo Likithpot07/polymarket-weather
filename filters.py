@@ -54,6 +54,10 @@ class Policy:
     min_forecast_distance_sigma: float = 0.0
     # Cities never to bet on (any bet type), e.g. ["Chicago"]. Case-insensitive.
     skip_cities: tuple[str, ...] = ()
+    # "Shadow" rules: soft rules listed here no longer block a bet. The bet goes
+    # through tagged with the rule name, so tagged vs clean bets can be compared
+    # (paper.py status). Hard rules can never be shadowed.
+    shadow_rules: tuple[str, ...] = ()
 
     @classmethod
     def from_config(cls, cfg: dict) -> "Policy":
@@ -65,6 +69,8 @@ class Policy:
             overrides = {**overrides, "allowed_sides": tuple(overrides["allowed_sides"])}
         if "skip_cities" in overrides:
             overrides = {**overrides, "skip_cities": tuple(overrides["skip_cities"])}
+        if "shadow_rules" in overrides:
+            overrides = {**overrides, "shadow_rules": tuple(str(r).upper() for r in overrides["shadow_rules"])}
         policy = cls(**overrides)
         if not policy.allowed_sides or set(policy.allowed_sides) - {"YES", "NO"}:
             raise ValueError("allowed_sides must contain YES and/or NO")
@@ -122,7 +128,8 @@ def assess(state: dict, outcome: dict, side: str, quote: dict | None,
               "raw_edge": None, "fee_per_share": None,
               "slippage_per_share": None, "entry_cost": None, "net_edge": None,
               "market_probability": None, "blended_probability": None,
-              "locked_no": bool(outcome.get("locked_no")) and side == "NO"}
+              "locked_no": bool(outcome.get("locked_no")) and side == "NO",
+              "tags": []}
     hard, soft = [], []
     if side not in policy.allowed_sides:
         hard.append("SIDE_DISABLED")
@@ -228,6 +235,9 @@ def assess(state: dict, outcome: dict, side: str, quote: dict | None,
     result["lead_days"] = lead_days
     if not result["locked_no"] and lead_days < policy.min_forecast_lead_days:
         soft.append("TOO_CLOSE_TO_TARGET_DAY")
+    shadow = set(policy.shadow_rules)
+    result["tags"] = [r for r in soft if r in shadow]
+    soft = [r for r in soft if r not in shadow]
     result["reasons"] = hard + soft
     result["action"] = "SKIP" if hard else "WATCH" if soft else "TRADE"
     return result

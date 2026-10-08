@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS paper_orders (
     settlement_source TEXT,
     last_error TEXT,
     legacy INTEGER NOT NULL DEFAULT 0,
+    tags TEXT NOT NULL DEFAULT '',
     UNIQUE(event_id,market_id,side,signal_at)
 );
 CREATE INDEX IF NOT EXISTS paper_order_status_time
@@ -172,25 +173,30 @@ def city_day_gate(
     target_date: str,
     decisions: list[dict],
     cfg: dict,
+    tagged: bool = False,
 ) -> tuple[bool, str]:
-    """Allow one fill per city/day; reopen only when the latest fill deteriorates."""
+    """Allow one fill per city/day; reopen only when the latest fill deteriorates.
+
+    Clean bets (no tags) and tagged bets (passed only because a rule is shadowed)
+    each get their own city/day slot, so one group never blocks the other."""
     pcfg = paper_config(cfg)
+    group = "p.tags!=''" if tagged else "p.tags=''"
     pending = db.execute(
-        """SELECT count(*)
+        f"""SELECT count(*)
            FROM paper_orders p
            JOIN markets m ON m.id=p.market_id
-           WHERE m.city=? AND m.target_date=? AND p.status='PENDING'""",
+           WHERE m.city=? AND m.target_date=? AND p.status='PENDING' AND {group}""",
         (city, target_date),
     ).fetchone()[0]
     if pending:
         return False, "CITY_DAY_PENDING_ORDER"
 
     filled = db.execute(
-        """SELECT count(*)
+        f"""SELECT count(*)
            FROM paper_orders p
            JOIN markets m ON m.id=p.market_id
            WHERE m.city=? AND m.target_date=?
-             AND p.filled_shares>0""",
+             AND p.filled_shares>0 AND {group}""",
         (city, target_date),
     ).fetchone()[0]
     if filled == 0:
@@ -199,10 +205,10 @@ def city_day_gate(
         return False, "CITY_DAY_MAX_TRADES"
 
     latest = db.execute(
-        """SELECT p.market_id,p.side,p.model_probability
+        f"""SELECT p.market_id,p.side,p.model_probability
            FROM paper_orders p
            JOIN markets m ON m.id=p.market_id
-           WHERE m.city=? AND m.target_date=? AND p.filled_shares>0
+           WHERE m.city=? AND m.target_date=? AND p.filled_shares>0 AND {group}
            ORDER BY p.fill_at DESC,p.id DESC
            LIMIT 1""",
         (city, target_date),
@@ -249,7 +255,10 @@ def schedule_order(
     ask = float(ask)
     if not 0 < ask < 1:
         return None
+    tags = ",".join(decision.get("tags") or [])
     big = decision.get("locked_no") or pcfg["big_bet_min_price"] <= ask <= pcfg["big_bet_max_price"]
+    if tags:
+        big = False  # tagged bets (shadowed rule failed) are always the small size
     notional = pcfg["notional_usd"] if big else pcfg["small_notional_usd"]
     desired_shares = notional / ask
     max_price = min(0.999, ask + pcfg["max_slippage_per_share"])
@@ -257,8 +266,8 @@ def schedule_order(
     cursor = db.execute(
         """INSERT OR IGNORE INTO paper_orders(
                event_id,market_id,side,token_id,bracket,signal_at,execute_after,status,
-               model_probability,signal_ask,desired_shares,max_price
-           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+               model_probability,signal_ask,desired_shares,max_price,tags
+           ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             state["event_id"],
             decision["market_id"],
@@ -272,6 +281,7 @@ def schedule_order(
             ask,
             desired_shares,
             max_price,
+            tags,
         ),
     )
     return cursor.lastrowid if cursor.rowcount else None
@@ -595,6 +605,10 @@ def tag_legacy_orders(db: sqlite3.Connection) -> None:
     STRATEGY_START) as legacy=1. Rows are kept, just ignored by stats and reports.
     New bets default to legacy=0. Safe to call every start."""
     cols = {row[1] for row in db.execute("PRAGMA table_info(paper_orders)")}
+    if "tags" not in cols:
+        # Shadow-rule tags (see filters.Policy.shadow_rules). '' = clean bet.
+        db.execute("ALTER TABLE paper_orders ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
+        db.commit()
     if "legacy" in cols:
         return
     db.execute("ALTER TABLE paper_orders ADD COLUMN legacy INTEGER NOT NULL DEFAULT 0")
@@ -641,6 +655,37 @@ def recent_stats(db: sqlite3.Connection, since: str) -> dict:
     return groups
 
 
+def tag_stats(db: sqlite3.Connection, since: str) -> dict:
+    """Clean bets vs tagged bets (placed only because a shadow rule was ignored).
+    A bet with two tags counts under each tag, so tag rows can overlap."""
+    groups: dict[str, dict] = {}
+    rows = db.execute(
+        """SELECT status,total_cost,pnl,tags FROM paper_orders
+           WHERE signal_at >= ? AND legacy=0""", (since,)).fetchall()
+    for status, cost, pnl, tags in rows:
+        names = [t for t in str(tags or "").split(",") if t]
+        keys = ["CLEAN (passed every rule)"] if not names else ["ANY TAG"] + [f"TAG {t}" for t in names]
+        for key in keys:
+            g = groups.setdefault(key, {"bets_placed": 0, "waiting_to_settle": 0, "settled": 0,
+                                        "wins": 0, "losses": 0, "profit_usd": 0.0,
+                                        "money_in_settled_bets": 0.0})
+            g["bets_placed"] += 1
+            if status in ("FILLED", "PARTIAL", "PENDING"):
+                g["waiting_to_settle"] += 1
+            elif status in ("SETTLED_WIN", "SETTLED_LOSS"):
+                g["settled"] += 1
+                g["wins" if status == "SETTLED_WIN" else "losses"] += 1
+                g["profit_usd"] += float(pnl or 0)
+                g["money_in_settled_bets"] += float(cost or 0)
+    for g in groups.values():
+        g["win_pct"] = round(100 * g["wins"] / g["settled"], 1) if g["settled"] else None
+        g["profit_usd"] = round(g["profit_usd"], 2)
+        g["return_pct"] = (round(100 * g["profit_usd"] / g["money_in_settled_bets"], 1)
+                           if g["money_in_settled_bets"] else None)
+        g["money_in_settled_bets"] = round(g["money_in_settled_bets"], 2)
+    return groups
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config.json")
@@ -666,6 +711,7 @@ def main() -> None:
             report = {
                 "NEW_BOT_TOTAL": stats(db),
                 f"NEW_BOT_BY_BET_TYPE (placed after {args.since})": recent_stats(db, args.since),
+                f"CLEAN_VS_TAGGED (placed after {args.since})": tag_stats(db, args.since),
             }
             if args.all:
                 report["OLD_BROKEN_BOT (hidden by default)"] = stats(db, legacy=1)

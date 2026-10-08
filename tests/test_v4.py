@@ -349,6 +349,30 @@ class LeadDaysTest(unittest.TestCase):
         self.assertIn("TOO_CLOSE_TO_TARGET_DAY", near["reasons"])
 
 
+class ShadowRuleTest(unittest.TestCase):
+    def _assess(self, shadow):
+        policy = Policy(allowed_sides=("NO",), require_verified_rules=False, min_net_edge=0.0,
+                        max_fade_market_yes=1.0, max_model_spread_c=0.6, shadow_rules=shadow)
+        comps = [dict(STATE["components"][0], mean=m) for m in (68, 70, 72)]  # 4F = 2.2C spread
+        return assess(dict(STATE, components=comps), {"market_id": "m", "p_yes": 0.1, "p_no": 0.9},
+                      "NO", QUOTE, AS_OF, "America/New_York", True, policy)
+
+    def test_rule_blocks_when_not_shadowed(self):
+        d = self._assess(())
+        self.assertEqual(d["action"], "WATCH")
+        self.assertIn("MODEL_DISAGREEMENT", d["reasons"])
+        self.assertEqual(d["tags"], [])
+
+    def test_shadowed_rule_tags_instead_of_blocking(self):
+        d = self._assess(("MODEL_DISAGREEMENT",))
+        self.assertEqual(d["action"], "TRADE", d["reasons"])
+        self.assertEqual(d["tags"], ["MODEL_DISAGREEMENT"])
+
+    def test_config_reads_shadow_rules(self):
+        p = Policy.from_config({"decision": {"shadow_rules": ["model_disagreement"]}})
+        self.assertEqual(p.shadow_rules, ("MODEL_DISAGREEMENT",))
+
+
 class VerifyStoreTest(unittest.TestCase):
     def test_verified_rules_overwrite_stale_auto_parse(self):
         from unittest.mock import patch

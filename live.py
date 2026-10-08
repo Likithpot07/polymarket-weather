@@ -305,9 +305,8 @@ def persist_candidate_audit(
     state: dict,
     decisions: list[dict],
     as_of: datetime,
-    scheduled_trade: dict | None,
-    allowed: bool,
-    gate_reason: str | None,
+    scheduled: list[dict],
+    skip_reasons: dict[int, str],
 ) -> None:
     """Persist why each eligible NO trade candidate was or was not selected."""
     row = db.execute(
@@ -323,17 +322,14 @@ def persist_candidate_audit(
         d for d in decisions
         if d.get("action") == "TRADE" and str(d.get("side")).upper() == "NO"
     ]
-    best = best_no_trade(current_trades)
     for decision in current_trades:
-        selected = scheduled_trade is decision
+        selected = any(decision is t for t in scheduled)
         if selected:
             reason = "SELECTED_AND_SCHEDULED"
-        elif best is not None and decision is not best:
-            reason = "LOWER_EDGE_THAN_SELECTED_NO"
-        elif not allowed:
-            reason = gate_reason or "CITY_DAY_GATE_BLOCKED"
         else:
-            reason = "PAPER_ORDER_NOT_SCHEDULED"
+            reason = skip_reasons.get(id(decision), "PAPER_ORDER_NOT_SCHEDULED")
+        if decision.get("tags"):
+            reason += " [TAGS:" + ",".join(decision["tags"]) + "]"
         db.execute(
             """INSERT OR REPLACE INTO paper_candidate_audit(
                    run_id,event_id,market_id,side,as_of,selected,selection_reason,
@@ -372,6 +368,8 @@ def format_trade(decision: dict) -> str:
         probability_text += f" mkt={market * 100:.1f}%"
     if decision.get("locked_no"):
         probability_text += " LOCKED"
+    if decision.get("tags"):
+        probability_text += " TAGGED:" + ",".join(decision["tags"])
     return (
         f"{decision['side']} | p={probability_text} | ask={ask_text} | "
         f"depth={depth_text} | net_edge={edge_text} | {decision.get('bracket')}"
@@ -496,8 +494,8 @@ def run_cycle(
         try:
             state, decisions = event_decisions(db, event_id, evaluation_time, policy)
             counts = Counter(d["action"] for d in decisions)
-            scheduled_trade = None
-            gate_reason = None
+            scheduled: list[dict] = []
+            skip_reasons: dict[int, str] = {}
             every = float(cfg.get("decision_store_minutes", 0))
             last_full = _LAST_FULL_STORE.get(event_id)
             store_full = (every <= 0 or last_full is None
@@ -511,35 +509,42 @@ def run_cycle(
                 locked = locked_candidates(db, state["event_id"], decisions)
                 if locked:
                     # Locked brackets can't win; each is its own trade, so skip the city-day limit.
-                    best = best_no_trade(locked)
-                    allowed, gate_reason = True, "LOCKED_NO"
+                    groups = [(locked, True, "LOCKED_NO", False)]
                 else:
-                    best = best_no_trade(decisions)
-                    allowed, gate_reason = city_day_gate(
-                        db,
-                        state["city"],
-                        state["target_date"],
-                        decisions,
-                        cfg,
-                    )
-                if allowed and best:
-                    order_id = schedule_order(
-                        db,
-                        state,
-                        best,
-                        datetime.now(timezone.utc),
-                        cfg,
-                    )
-                    if order_id:
-                        scheduled_trade = best
+                    # Clean bets and tagged bets (shadow rule failed) each get their own slot.
+                    groups = []
+                    for is_tagged in (False, True):
+                        group = [d for d in decisions if bool(d.get("tags")) == is_tagged]
+                        allowed, reason = city_day_gate(
+                            db, state["city"], state["target_date"], decisions, cfg,
+                            tagged=is_tagged,
+                        )
+                        groups.append((group, allowed, reason, is_tagged))
+                for group, allowed, reason, _ in groups:
+                    best = best_no_trade(group)
+                    if allowed and best:
+                        order_id = schedule_order(
+                            db, state, best, datetime.now(timezone.utc), cfg,
+                        )
+                        if order_id:
+                            scheduled.append(best)
+                    for d in group:
+                        if d is best and any(d is t for t in scheduled):
+                            continue
+                        if best is not None and d is not best:
+                            skip_reasons[id(d)] = "LOWER_EDGE_THAN_SELECTED_NO"
+                        elif not allowed:
+                            skip_reasons[id(d)] = reason or "CITY_DAY_GATE_BLOCKED"
+                        else:
+                            skip_reasons[id(d)] = "PAPER_ORDER_NOT_SCHEDULED"
+                gate_reason = ",".join(r for _, _, r, _ in groups if r)
                 persist_candidate_audit(
                     db,
                     state,
                     decisions,
                     evaluation_time,
-                    scheduled_trade,
-                    allowed,
-                    gate_reason,
+                    scheduled,
+                    skip_reasons,
                 )
             summary["events"] += 1
             summary["trade"] += counts.get("TRADE", 0)
@@ -561,23 +566,17 @@ def run_cycle(
             for decision in current_trades:
                 prefix = "NEW TRADE SIGNAL" if decision in new_trades else "TRADE NOW"
                 print(f"{prefix} | {format_trade(decision)}", flush=True)
-            if scheduled_trade:
+            for trade in scheduled:
                 print(
-                    f"PAPER ORDER SCHEDULED | {format_trade(scheduled_trade)} | "
+                    f"PAPER ORDER SCHEDULED | {format_trade(trade)} | "
                     f"gate={gate_reason}",
                     flush=True,
                 )
             if current_trades:
-                best = best_no_trade(current_trades)
                 for decision in current_trades:
-                    if scheduled_trade is decision:
+                    if any(decision is t for t in scheduled):
                         continue
-                    if best is not None and decision is not best:
-                        reason = "LOWER_EDGE_THAN_SELECTED_NO"
-                    elif not allowed:
-                        reason = gate_reason or "CITY_DAY_GATE_BLOCKED"
-                    else:
-                        reason = "PAPER_ORDER_NOT_SCHEDULED"
+                    reason = skip_reasons.get(id(decision), "PAPER_ORDER_NOT_SCHEDULED")
                     print(
                         f"PAPER TRADE SKIPPED | {format_trade(decision)} | reason={reason}",
                         flush=True,

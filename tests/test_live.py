@@ -79,9 +79,8 @@ class LivePersistenceTest(unittest.TestCase):
                 self.state,
                 [no_trade],
                 self.as_of,
-                scheduled_trade=None,
-                allowed=False,
-                gate_reason="CITY_DAY_HEALTHY_POSITION",
+                scheduled=[],
+                skip_reasons={id(no_trade): "CITY_DAY_HEALTHY_POSITION"},
             )
         row = self.db.execute(
             """SELECT selected,selection_reason,net_edge

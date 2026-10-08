@@ -173,6 +173,34 @@ class PaperTradingTest(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(reason, "CITY_DAY_MAX_TRADES")
 
+    def test_clean_and_tagged_bets_have_separate_city_day_slots(self):
+        cfg = {"paper": dict(self.cfg["paper"], max_trades_per_city_day=1)}
+        self.db.execute(
+            """INSERT INTO paper_orders(
+                   event_id,market_id,side,token_id,bracket,signal_at,execute_after,status,
+                   model_probability,signal_ask,desired_shares,max_price,filled_shares,fill_at,tags
+               ) VALUES ('e1','m1','NO','t','b','2026-09-28T08:00:00+00:00',
+                         '2026-09-28T08:00:01+00:00','FILLED',0.9,0.7,10,0.73,10,
+                         '2026-09-28T08:00:01+00:00','')""")
+        decisions = [{"market_id": "m1", "side": "NO", "model_probability": 0.9}]
+        clean_ok, _ = city_day_gate(self.db, "NYC", "2026-09-28", decisions, cfg)
+        tagged_ok, reason = city_day_gate(self.db, "NYC", "2026-09-28", decisions, cfg, tagged=True)
+        self.assertFalse(clean_ok)
+        self.assertTrue(tagged_ok)
+        self.assertEqual(reason, "FIRST_CITY_DAY_TRADE")
+
+    def test_tagged_bet_is_small_size_and_stores_tags(self):
+        cfg = {"paper": dict(self.cfg["paper"], notional_usd=30.0, small_notional_usd=10.0,
+                             big_bet_min_price=0.70, big_bet_max_price=0.80)}
+        decision = {"action": "TRADE", "side": "NO", "market_id": "m1", "token_id": "tok",
+                    "best_ask": 0.75, "model_probability": 0.9, "bracket": "b",
+                    "tags": ["MODEL_DISAGREEMENT"]}
+        schedule_order(self.db, {"event_id": "e1"}, decision,
+                       datetime(2026, 9, 28, 8, tzinfo=timezone.utc), cfg)
+        shares, tags = self.db.execute("SELECT desired_shares,tags FROM paper_orders").fetchone()
+        self.assertAlmostEqual(shares * 0.75, 10.0)
+        self.assertEqual(tags, "MODEL_DISAGREEMENT")
+
     def test_gamma_outcome_prices_map_to_yes_result(self):
         event = {
             "closed": True,
