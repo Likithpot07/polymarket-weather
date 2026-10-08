@@ -30,6 +30,9 @@
   "paper": {
     "enabled": true,
     "notional_usd": 30,
+    "small_notional_usd": 10,
+    "big_bet_min_price": 0.70,
+    "big_bet_max_price": 0.80,
     "latency_ms": 1000,
     "max_slippage_per_share": 0.03,
     "max_book_age_seconds": 10800,

@@ -63,6 +63,12 @@ def paper_config(cfg: dict) -> dict:
     result = {
         "enabled": bool(raw.get("enabled", True)),
         "notional_usd": float(raw.get("notional_usd", 10.0)),
+        # Bet sizing: full notional_usd only for the safest-looking bets (NO price in the
+        # "big bet" range, or a locked NO); every other bet uses small_notional_usd.
+        # Unset small_notional_usd = old behaviour (every bet uses notional_usd).
+        "small_notional_usd": float(raw.get("small_notional_usd", raw.get("notional_usd", 10.0))),
+        "big_bet_min_price": float(raw.get("big_bet_min_price", 0.0)),
+        "big_bet_max_price": float(raw.get("big_bet_max_price", 1.0)),
         "latency_ms": float(raw.get("latency_ms", 1000.0)),
         "max_slippage_per_share": float(raw.get("max_slippage_per_share", 0.03)),
         "max_book_age_seconds": float(raw.get("max_book_age_seconds", 10.0)),
@@ -243,7 +249,9 @@ def schedule_order(
     ask = float(ask)
     if not 0 < ask < 1:
         return None
-    desired_shares = pcfg["notional_usd"] / ask
+    big = decision.get("locked_no") or pcfg["big_bet_min_price"] <= ask <= pcfg["big_bet_max_price"]
+    notional = pcfg["notional_usd"] if big else pcfg["small_notional_usd"]
+    desired_shares = notional / ask
     max_price = min(0.999, ask + pcfg["max_slippage_per_share"])
     execute_after = signal_at + timedelta(milliseconds=pcfg["latency_ms"])
     cursor = db.execute(
