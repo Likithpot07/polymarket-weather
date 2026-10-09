@@ -478,6 +478,40 @@ def short_question(text: str | None) -> str:
     return f"{m.group(1)}: {m.group(2)}" if m else (text or "")[:60]
 
 
+TAG_NAMES = {"MODEL_DISAGREEMENT": "models disagree",
+             "FORECAST_TOO_CLOSE_TO_BRACKET": "forecast close to bracket"}
+TAGGING_START = "2026-10-08T08:00:00+00:00"  # bets before this were never tagged
+ALERT_TZ = "Asia/Kolkata"  # times in Telegram alerts
+
+
+def tag_line(db: sqlite3.Connection, order_id) -> str:
+    """Telegram lines: when the bet was placed, its target day, and clean/tagged."""
+    from zoneinfo import ZoneInfo
+    try:
+        row = db.execute(
+            """SELECT p.tags,p.signal_at,m.target_date FROM paper_orders p
+               LEFT JOIN markets m ON m.id=p.market_id WHERE p.id=?""", (order_id,)).fetchone()
+    except sqlite3.Error:
+        return ""
+    if not row:
+        return ""
+    tags_text, signal_at, target = row
+    lines = []
+    try:
+        placed = datetime.fromisoformat(str(signal_at)).astimezone(ZoneInfo(ALERT_TZ))
+        lines.append(f"Placed {placed:%d %b %H:%M} IST" + (f" | for {target}" if target else ""))
+    except (TypeError, ValueError):
+        pass
+    tags = [t for t in str(tags_text or "").split(",") if t]
+    if tags:
+        lines.append("🏷 TAGGED: " + ", ".join(TAG_NAMES.get(t, t) for t in tags))
+    elif str(signal_at) < TAGGING_START:
+        lines.append("⚪ placed before tagging started")
+    else:
+        lines.append("🟢 CLEAN (passed every rule)")
+    return "".join("\n" + line for line in lines)
+
+
 def run_cycle(
     db: sqlite3.Connection,
     policy: Policy,
@@ -609,7 +643,8 @@ def run_cycle(
             flush=True,
         )
         telegram(f"🟦 NEW BET (paper)\nNO on {short_question(item.get('bracket'))}\n"
-                 f"Paid ${item['total_cost']:.2f} at {item['vwap']:.2f} | win pays ${item['filled_shares']:.2f}")
+                 f"Paid ${item['total_cost']:.2f} at {item['vwap']:.2f} | win pays ${item['filled_shares']:.2f}"
+                 f"{tag_line(db, item.get('order_id'))}")
     for item in settled:
         print(
             f"PAPER SETTLED | {item['side']} | {item['status']} | "
@@ -619,7 +654,8 @@ def run_cycle(
         row = db.execute("SELECT bracket FROM paper_orders WHERE id=?", (item["order_id"],)).fetchone()
         won = item["status"] == "SETTLED_WIN"
         telegram(f"{'✅ WON' if won else '❌ LOST'} {item['pnl']:+.2f} USD (paper)\n"
-                 f"NO on {short_question(row[0] if row else '')}")
+                 f"NO on {short_question(row[0] if row else '')}"
+                 f"{tag_line(db, item.get('order_id'))}")
     if settled:
         st = paper_stats(db)
         telegram(f"📊 New bot paper P&L: {st['realized_pnl']:+.2f} USD | "
