@@ -1208,17 +1208,20 @@ def _install_stop_handlers() -> None:
                 pass
 
 
-def _stop_alert(reason: str) -> None:
-    """Telegram message when the collector stops (reuses live.py's sender and .env)."""
+def _alert(text: str, timeout: float = 4) -> None:
+    """Telegram message about the collector (reuses live.py's sender and .env)."""
     try:
         sys.modules.setdefault("collector", sys.modules[__name__])  # don't load this file twice
         from live import load_env, telegram
         load_env(Path(__file__).resolve().parent / ".env")
-        telegram(f"🛑 Collector (collector.py) STOPPED - {reason}\n"
-                 "No new prices/forecasts until you restart it: python collector.py collect",
-                 timeout=4)
+        telegram(text, timeout=timeout)
     except Exception as exc:  # an alert problem must never hide the real error
-        LOG.warning("stop alert failed: %s", type(exc).__name__)
+        LOG.warning("telegram alert failed: %s", type(exc).__name__)
+
+
+def _stop_alert(reason: str) -> None:
+    _alert(f"🛑 Collector (collector.py) STOPPED - {reason}\n"
+           "No new prices/forecasts until you restart it: python collector.py collect")
 
 
 def main() -> None:
@@ -1226,6 +1229,7 @@ def main() -> None:
     alert = len(sys.argv) > 1 and sys.argv[1] == "collect" and "--once" not in sys.argv
     if alert:
         _install_stop_handlers()
+        _alert("🟢 Collector (collector.py) started - collecting prices and forecasts", timeout=10)
     reason = "finished"
     try:
         _main()
