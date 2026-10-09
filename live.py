@@ -664,6 +664,37 @@ def run_cycle(
     return summary
 
 
+class CollectorWatch:
+    """Telegram alert when collector.py goes quiet (crash, hang, window closed, laptop
+    issue) and again when it is back. Watches the newest book_events row id, which
+    only grows while the collector streams prices (cheap: primary-key lookup)."""
+
+    def __init__(self, silent_minutes: float):
+        self.silent_seconds = silent_minutes * 60
+        self.last_id = None
+        self.last_change = time.monotonic()
+        self.alerted = False
+
+    def check(self, db: sqlite3.Connection) -> None:
+        if self.silent_seconds <= 0:
+            return
+        try:
+            newest = db.execute("SELECT max(id) FROM book_events").fetchone()[0]
+        except sqlite3.Error:
+            return
+        now = time.monotonic()
+        if newest != self.last_id:
+            if self.alerted:
+                telegram("✅ Collector is running again - new prices are coming in.")
+            self.last_id, self.last_change, self.alerted = newest, now, False
+        elif not self.alerted and now - self.last_change >= self.silent_seconds:
+            minutes = (now - self.last_change) / 60
+            telegram(f"⚠️ Collector looks STOPPED - no new prices for {minutes:.0f} min.\n"
+                     "live.py is still running but can't place good bets without fresh data.\n"
+                     "Restart it: python collector.py collect")
+            self.alerted = True
+
+
 class _StopSignal(Exception):
     """Raised when Windows/OS asks the bot to stop (window closed, shutdown, kill)."""
 
@@ -748,10 +779,13 @@ def _main() -> None:
         flush=True,
     )
 
+    watch = CollectorWatch(float(cfg.get("collector_silent_minutes", 15)))
     try:
         while True:
             cycle_started = time.monotonic()
             summary = run_cycle(db, policy, requested_events, None, cfg)
+            if not args.once:
+                watch.check(db)
             print(
                 f"CYCLE | events={summary['events']} TRADE={summary['trade']} "
                 f"WATCH={summary['watch']} SKIP={summary['skip']} "

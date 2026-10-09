@@ -1191,7 +1191,62 @@ def import_observations(db: sqlite3.Connection, path: str) -> None:
                        (row["market_id"], row["station"], timestamp.astimezone(timezone.utc).isoformat(),
                         float(row["temperature"]), row["unit"], row["source_url"], row.get("source_record_id"), utc_now(), json.dumps(row)))
     print(f"Imported {len(rows)} observations")
+class _StopSignal(Exception):
+    """Raised when Windows/OS asks the collector to stop (window closed, shutdown, kill)."""
+
+
+def _install_stop_handlers() -> None:
+    import signal
+
+    def handler(signum, _frame):
+        raise _StopSignal(f"window closed or system stop (signal {signum})")
+    for name in ("SIGTERM", "SIGBREAK"):  # SIGBREAK = console window closed on Windows
+        if hasattr(signal, name):
+            try:
+                signal.signal(getattr(signal, name), handler)
+            except (ValueError, OSError):
+                pass
+
+
+def _stop_alert(reason: str) -> None:
+    """Telegram message when the collector stops (reuses live.py's sender and .env)."""
+    try:
+        sys.modules.setdefault("collector", sys.modules[__name__])  # don't load this file twice
+        from live import load_env, telegram
+        load_env(Path(__file__).resolve().parent / ".env")
+        telegram(f"🛑 Collector (collector.py) STOPPED - {reason}\n"
+                 "No new prices/forecasts until you restart it: python collector.py collect",
+                 timeout=4)
+    except Exception as exc:  # an alert problem must never hide the real error
+        LOG.warning("stop alert failed: %s", type(exc).__name__)
+
+
 def main() -> None:
+    """Runs the collector; for `collect` (not --once) always sends a Telegram alert when it stops."""
+    alert = len(sys.argv) > 1 and sys.argv[1] == "collect" and "--once" not in sys.argv
+    if alert:
+        _install_stop_handlers()
+    reason = "finished"
+    try:
+        _main()
+    except KeyboardInterrupt:
+        reason = "stopped by you (Ctrl+C)"
+        LOG.info("Stopped")
+    except _StopSignal as exc:
+        reason = str(exc)
+    except SystemExit as exc:
+        reason = f"exited (code {exc.code})"
+        raise
+    except BaseException as exc:
+        detail = re.sub(r"bot[0-9]+:[A-Za-z0-9_-]+", "bot***", f"{type(exc).__name__}: {exc}")
+        reason = f"CRASHED - {detail}"[:300]
+        raise
+    finally:
+        if alert:
+            _stop_alert(reason)
+
+
+def _main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("collect", "status", "import-observations", "compact"))
     parser.add_argument("--config", default="config.json")
@@ -1225,8 +1280,6 @@ def main() -> None:
             import_observations(db, args.csv)
             return
         asyncio.run(collect(db, cfg, args.seconds, args.once))
-    except KeyboardInterrupt:
-        LOG.info("Stopped")
     finally:
         db.close()
 if __name__ == "__main__":

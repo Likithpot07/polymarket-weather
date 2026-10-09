@@ -22,6 +22,7 @@
   "keep_decision_days": 7,
   "prune_interval_hours": 6,
   "decision_store_minutes": 10,
+  "collector_silent_minutes": 15,
   "auto_prepare": true,
   "prepare_interval_seconds": 900,
   "prepare_retry_hours": 6,
